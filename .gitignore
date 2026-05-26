@@ -1,4 +1,11 @@
+vendor/
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.venv/
 .DS_Store
 .vscode/

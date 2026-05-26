@@ -1,0 +1,7 @@
+pytest
+pytest-asyncio
+pytest-cov
+mypy
+ruff
+black
+requests>=2.31
