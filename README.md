@@ -55,3 +55,15 @@ Das Plugin verlässt sich auf Bibliotheken, die in `lyndrix-core` bereitgestellt
 
 ## 📝 Lizenz
 Internes Tool. Nutzung auf eigene Gefahr während offizieller Meetings.
+## Project structure
+
+This plugin now follows the Lyndrix plugin standard with modular code under `app/`:
+
+- `entrypoint.py`: manifest and lifecycle wiring only
+- `app/controller/`: webhook sender and `DiscordNotifierService`
+- `app/ui/settings.py`: NiceGUI settings UI
+- `tests/`: service smoke tests
+
+## Secrets / Vault
+
+The Discord webhook URL is stored as a plugin secret via `ctx.set_secret("webhook_url", ...)` and read with `ctx.get_secret("webhook_url")`, scoped to this plugin's namespace in the Lyndrix Vault.
