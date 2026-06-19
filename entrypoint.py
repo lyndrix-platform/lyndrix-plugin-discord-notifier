@@ -27,7 +27,7 @@ from .app.ui.settings import render_settings_ui as modular_settings_ui
 manifest = ModuleManifest(
     id="lyndrix.plugin.discord",
     name="Discord Notifier",
-    version="0.0.7",
+    version="0.0.8",
     description=(
         "Two-way Discord integration via the Lyndrix Messaging Gateway. "
         "Supports multiple channel instances via env vars."

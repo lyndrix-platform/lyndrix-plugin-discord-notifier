@@ -1,0 +1,28 @@
+site_name: Lyndrix Discord Notifier
+site_description: Documentation for the Lyndrix Discord Notifier plugin
+site_url: https://discord-notifier.docs.lyndrix.eu
+site_dir: .cache/site
+repo_url: https://github.com/lyndrix-platform/lyndrix-plugin-discord-notifier
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: emerald
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: emerald
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+
+nav:
+  - Home: index.md
+  - Usage: usage.md
+  - Configuration: configuration.md

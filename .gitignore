@@ -9,3 +9,6 @@ htmlcov/
 .venv/
 .DS_Store
 .vscode/
+
+# Generated docs build output
+.cache/
