@@ -1,69 +1,56 @@
-# Lyndrix Meeting Bingo Plugin
+# Lyndrix Discord Notifier
 
-**Version:** 1.2.0  
-**Autor:** Lyndrix
+**Plugin ID:** `lyndrix.plugin.discord`
 
-Ein Multiplayer Bullshit-Bingo Plugin, das nahtlos in die Lyndrix-Plattform integriert ist. Perfekt, um langatmige Meetings mit etwas Gamification aufzulockern.
+A [Lyndrix](https://github.com/lyndrix-platform/lyndrix-core) plugin providing **two-way
+Discord integration** (bot API + webhook), implemented as a
+[Messaging Gateway](https://docs.lyndrix.eu/core-components/messaging/) `GatewayAdapter`.
+It supports **multiple independent instances** for different Discord channels/servers.
 
-## 📋 Features
+## Features
 
-- **Multiplayer Lobby**: Erstelle Bingo-Sessions mit anpassbarer Feldgröße (3x3 bis 5x5).
-- **Echtzeit-Synchronisation**: Sieh live, wie deine Kollegen ihre Felder markieren (und wer kurz vor dem Sieg steht).
-- **Wall of Shame**: Ein optionales Scoreboard, das die Gewinner persistent im Lyndrix Vault speichert.
-- **Sarkastische Kommentare**: Das System kommentiert deine Leistung (oder deren Fehlen).
-- **Integrierte Begriffe**: Kommt mit einer kuratierten Liste an Buzzwords (`terms.txt`), die pro Session angepasst werden kann.
+- **Dual-mode delivery** — Discord bot API and/or incoming webhooks.
+- **Multiple instances** — register several Discord targets (e.g. `ops`, `alerts`) at once.
+- **Gateway adapter** — outbound messages routed via `messaging:outbound`; supports interactive
+  actions/replies through the gateway's correlation mechanism.
 
-## 🚀 Installation
+## Configuration
 
-Da es sich um ein Plugin für `lyndrix-core` handelt, muss es im Plugin-Verzeichnis der Hauptanwendung installiert werden.
+Instances are declared via the gateway provider env vars, with a per-instance webhook URL:
 
-1. Navigiere in das Plugin-Verzeichnis deiner `lyndrix-core` Installation:
-   ```bash
-   cd /pfad/zu/lyndrix-core/plugins
-   ```
+```bash
+LYNDRIX_GATEWAY_PROVIDERS=discord:ops,discord:alerts
+LYNDRIX_GATEWAY_DISCORD_OPS_WEBHOOK_URL=https://discord.com/api/webhooks/…
+LYNDRIX_GATEWAY_DISCORD_ALERTS_WEBHOOK_URL=https://discord.com/api/webhooks/…
+```
 
-2. Klone dieses Repository:
-   ```bash
-   git clone https://github.com/lyndrix/lyndrix-meeting-bingo.git lyndrix.plugin.bingo
-   ```
-   *Hinweis: Der Zielordnername `lyndrix.plugin.bingo` wird empfohlen, damit die ID im Manifest sauber matcht.*
+When `LYNDRIX_GATEWAY_PROVIDERS` is unset, a single default instance is registered and reads
+its webhook URL from **Vault** (set via the settings UI / `ctx.set_secret("webhook_url", …)`,
+read with `ctx.get_secret("webhook_url")`, scoped to this plugin's namespace).
 
-3. Starte die Lyndrix-Anwendung neu. Das Plugin wird automatisch geladen und ist unter der Route `/bingo` erreichbar.
+## Installation
 
-## ⚙️ Konfiguration
+Install from the Lyndrix **Plugin Manager**, or via `LYNDRIX_PLUGINS_DESIRED`:
 
-Das Plugin nutzt die interne `ctx` API von Lyndrix für Einstellungen und Secrets.
+```text
+https://github.com/lyndrix-platform/lyndrix-plugin-discord-notifier
+```
 
-### Scoreboard (Wall of Shame)
-Standardmäßig ist das dauerhafte Speichern von Gewinnern deaktiviert (aus "ethischen" Gründen).
-Um es zu aktivieren:
-1. Öffne das Plugin in der UI.
-2. Scrolle zu den Einstellungen.
-3. Aktiviere den Switch **"Scoreboard aktivieren"**.
-4. Die Daten werden sicher im Vault unter dem Key `bingo_scoreboard` abgelegt.
-
-## 🛠 Entwicklung & Struktur
-
-- `__init__.py`: Enthält die komplette Logik, UI (NiceGUI) und das Plugin-Manifest.
-- `terms.txt`: Standardliste der Buzzwords (wird neu erstellt, falls gelöscht).
-
-### Abhängigkeiten
-Das Plugin verlässt sich auf Bibliotheken, die in `lyndrix-core` bereitgestellt werden:
-- `nicegui`
-- `core.modules.models`
-- `ui.layout` / `ui.theme`
-
-## 📝 Lizenz
-Internes Tool. Nutzung auf eigene Gefahr während offizieller Meetings.
 ## Project structure
 
-This plugin now follows the Lyndrix plugin standard with modular code under `app/`:
+```
+entrypoint.py          # manifest + lifecycle wiring only
+app/controller/        # DiscordGatewayAdapter, webhook sender, DiscordNotifierService
+app/ui/settings.py     # NiceGUI settings UI
+tests/                 # service smoke tests
+```
 
-- `entrypoint.py`: manifest and lifecycle wiring only
-- `app/controller/`: webhook sender and `DiscordNotifierService`
-- `app/ui/settings.py`: NiceGUI settings UI
-- `tests/`: service smoke tests
+## Documentation
 
-## Secrets / Vault
+- Plugin docs: https://discord-notifier.docs.lyndrix.eu
+- Platform docs: https://docs.lyndrix.eu — see
+  [Messaging Gateway](https://docs.lyndrix.eu/core-components/messaging/).
 
-The Discord webhook URL is stored as a plugin secret via `ctx.set_secret("webhook_url", ...)` and read with `ctx.get_secret("webhook_url")`, scoped to this plugin's namespace in the Lyndrix Vault.
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
