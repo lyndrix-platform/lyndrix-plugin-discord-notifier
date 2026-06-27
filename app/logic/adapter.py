@@ -32,23 +32,20 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, ClassVar
+from typing import ClassVar
 from uuid import UUID
 
 import requests
 
 from core.api import (
-    ActionButton,
     GatewayAdapter,
     GatewayCapability,
     InboundMessage,
     MessageSeverity,
+    ModuleContext,
     OutboundMessage,
     ProviderConfigField,
 )
-
-if TYPE_CHECKING:
-    from core.components.plugins.logic.context import ModuleContext
 
 log = logging.getLogger("Plugin:DiscordAdapter")
 
@@ -117,6 +114,9 @@ class DiscordGatewayAdapter(GatewayAdapter):
     # provider_id is set dynamically in __init__; ClassVar annotation kept for ABC.
     provider_id:  str = "discord"
     display_name: str = "Discord"
+    # TODO(agent): FILE_ATTACHMENTS is advertised but no send path performs
+    # multipart attachment upload (only embeds, images-by-URL and buttons).
+    # Implement multipart upload or drop this flag.
     capabilities        = (
         GatewayCapability.TEXT
         | GatewayCapability.RICH_MEDIA
@@ -127,7 +127,7 @@ class DiscordGatewayAdapter(GatewayAdapter):
     # Discord webhooks are fast; 20 s is generous but avoids gateway timeout.
     send_timeout: ClassVar[float] = 20.0
 
-    def __init__(self, ctx: "ModuleContext", instance_id: str = "default") -> None:
+    def __init__(self, ctx: ModuleContext, instance_id: str = "default") -> None:
         self._ctx         = ctx
         self._instance_id = instance_id
         self.provider_id  = "discord" if instance_id == "default" else f"discord:{instance_id}"
@@ -169,6 +169,14 @@ class DiscordGatewayAdapter(GatewayAdapter):
             if self._instance_id == "default"
             else f"{self._instance_id}_{setting.lower()}"
         )
+
+    def vault_key(self, setting: str) -> str:
+        """Public accessor for the per-instance Vault key of a config *setting*.
+
+        Lets UIs persist values through ``save_config()`` without reaching into
+        the adapter's private key-mapping helper.
+        """
+        return self._vault_key(setting)
 
     def _get_config(self, key: str) -> str | None:
         """Read a per-instance config value: env var first, then Vault."""
@@ -221,7 +229,14 @@ class DiscordGatewayAdapter(GatewayAdapter):
     # ------------------------------------------------------------------
 
     async def health(self) -> bool:
-        """Return True if either Bot API (bot_token + channel_id) or a webhook URL is configured."""
+        """Return True if either Bot API (bot_token + channel_id) or a webhook URL is configured.
+
+        Config resolution may hit Vault (synchronous hvac), so it is offloaded
+        to a thread to keep the event loop responsive.
+        """
+        return await asyncio.to_thread(self._health_sync)
+
+    def _health_sync(self) -> bool:
         has_bot_api = bool(self._get_config("bot_token") and self._get_config("channel_id"))
         has_webhook = bool(self._get_config("webhook_url"))
         return has_bot_api or has_webhook
@@ -231,14 +246,17 @@ class DiscordGatewayAdapter(GatewayAdapter):
     # ------------------------------------------------------------------
 
     async def send(self, message: OutboundMessage) -> str | None:
+        # All work below (Vault config reads + the HTTP call) is synchronous, so
+        # run the whole dispatch in a worker thread to keep the loop unblocked.
+        return await asyncio.to_thread(self._send_sync, message)
+
+    def _send_sync(self, message: OutboundMessage) -> str | None:
         # Prefer the Bot API (supports editing). Fall back to webhook when no
         # bot_token/channel_id is configured.
         bot_token  = self._get_config("bot_token")
         channel_id = self._get_config("channel_id")
         if bot_token and channel_id:
-            return await asyncio.to_thread(
-                self._send_via_bot_api, message, bot_token, channel_id
-            )
+            return self._send_via_bot_api(message, bot_token, channel_id)
 
         webhook_url = self._get_config("webhook_url")
         if not webhook_url:
@@ -250,41 +268,37 @@ class DiscordGatewayAdapter(GatewayAdapter):
 
         bot_name = self._get_config("bot_name") or "Lyndrix"
         payload  = self._build_payload(message, bot_name)
-        instance = self._instance_id   # capture for closure
+        instance = self._instance_id
 
-        def _post() -> str | None:
-            """Synchronous HTTP call wrapped in asyncio.to_thread for non-blocking dispatch."""
-            try:
+        try:
+            resp = requests.post(str(webhook_url), json=payload, timeout=_HTTP_TIMEOUT)
+
+            # Rate-limited: wait for the Retry-After window, then retry once.
+            if resp.status_code == 429:
+                retry_after = 5.0
+                try:
+                    retry_after = float(resp.json().get("retry_after", 5.0))
+                except Exception:
+                    pass
+                log.warning(
+                    "Discord adapter [%s]: rate limited (429) — sleeping %.1fs before retry.",
+                    instance, retry_after,
+                )
+                time.sleep(retry_after)
                 resp = requests.post(str(webhook_url), json=payload, timeout=_HTTP_TIMEOUT)
 
-                # Rate-limited: wait for the Retry-After window, then retry once.
-                if resp.status_code == 429:
-                    retry_after = 5.0
-                    try:
-                        retry_after = float(resp.json().get("retry_after", 5.0))
-                    except Exception:
-                        pass
-                    log.warning(
-                        "Discord adapter [%s]: rate limited (429) — sleeping %.1fs before retry.",
-                        instance, retry_after,
-                    )
-                    time.sleep(retry_after)
-                    resp = requests.post(str(webhook_url), json=payload, timeout=_HTTP_TIMEOUT)
+            if resp.status_code in (200, 204):
+                log.debug("Discord adapter [%s]: delivered (HTTP %s).", instance, resp.status_code)
+                return str(resp.status_code)
 
-                if resp.status_code in (200, 204):
-                    log.debug("Discord adapter [%s]: delivered (HTTP %s).", instance, resp.status_code)
-                    return str(resp.status_code)
-
-                log.warning(
-                    "Discord adapter [%s]: webhook returned %s — %s",
-                    instance, resp.status_code, resp.text[:200],
-                )
-                return None
-            except Exception as exc:
-                log.error("Discord adapter [%s]: send failed: %s", instance, exc)
-                return None
-
-        return await asyncio.to_thread(_post)
+            log.warning(
+                "Discord adapter [%s]: webhook returned %s — %s",
+                instance, resp.status_code, resp.text[:200],
+            )
+            return None
+        except Exception as exc:
+            log.error("Discord adapter [%s]: send failed: %s", instance, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Bot API delivery (POST/PATCH /channels/{id}/messages)
@@ -506,7 +520,7 @@ class DiscordGatewayAdapter(GatewayAdapter):
                 log.warning("Discord adapter: invalid correlation_id in custom_id: %s", corr_str)
 
         return InboundMessage(
-            provider_id="discord",
+            provider_id=self.provider_id,
             event_type="component_interaction",
             correlation_id=correlation_id,
             action_id=action_id or None,

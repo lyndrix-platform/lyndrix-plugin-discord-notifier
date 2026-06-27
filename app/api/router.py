@@ -7,27 +7,36 @@ slash command) attached to a message this adapter sent.
 Security: Discord signs every interaction request with an Ed25519 keypair.
 We MUST verify the signature before processing.  Unauthenticated requests
 MUST return HTTP 401; missing the verification entirely would allow any
-attacker to fake button-click events.
+attacker to fake button-click events.  When no public key is configured the
+endpoint fails closed (HTTP 503) and refuses to process interactions.
 
 Set up in Discord Developer Portal:
   Interactions Endpoint URL: https://<your-lyndrix-host>/api/plugins/lyndrix.plugin.discord/interactions
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from core.api import messaging_gateway
+
 if TYPE_CHECKING:
-    from .adapter import DiscordGatewayAdapter
+    from ..logic.adapter import DiscordGatewayAdapter
 
 log = logging.getLogger("Plugin:DiscordRouter")
 
 # Interaction type constants
 _TYPE_PING       = 1
 _TYPE_COMPONENT  = 3
+
+# Reject interactions whose signed timestamp is older than this (replay window).
+_MAX_TIMESTAMP_SKEW = 300  # seconds
 
 
 def build_interaction_router(adapter: "DiscordGatewayAdapter") -> APIRouter:
@@ -42,21 +51,36 @@ def build_interaction_router(adapter: "DiscordGatewayAdapter") -> APIRouter:
         timestamp = request.headers.get("X-Signature-Timestamp", "")
 
         # Verify Ed25519 signature ----------------------------------------
-        public_key_hex = adapter._ctx.get_secret("discord_public_key") or ""
-        if public_key_hex:
-            if not _verify_discord_signature(public_key_hex, timestamp, body, signature):
-                log.warning("Discord router: signature verification failed.")
-                raise HTTPException(status_code=401, detail="Invalid request signature")
-        else:
+        # Vault reads are synchronous (hvac) — offload to a thread so we never
+        # block the event loop.
+        public_key_hex = await asyncio.to_thread(
+            adapter._ctx.get_secret, "discord_public_key"
+        ) or ""
+        # Fail closed: without a configured public key we cannot authenticate
+        # the request, so refuse to process it rather than trusting it blindly.
+        # TODO(agent): make the public key required config for inbound and mark
+        # the adapter inbound-disabled/unhealthy while it is absent.
+        if not public_key_hex:
             log.warning(
                 "Discord router: 'discord_public_key' not configured — "
-                "signature verification DISABLED (insecure, configure immediately)."
+                "refusing interaction (signature verification unavailable)."
             )
+            raise HTTPException(
+                status_code=503,
+                detail="Discord interactions disabled: public key not configured",
+            )
+        if not _verify_discord_signature(public_key_hex, timestamp, body, signature):
+            log.warning("Discord router: signature verification failed.")
+            raise HTTPException(status_code=401, detail="Invalid request signature")
 
-        import json as _json
+        # Replay protection: reject stale (but validly-signed) interactions.
+        if not _timestamp_is_fresh(timestamp):
+            log.warning("Discord router: rejecting stale interaction timestamp.")
+            raise HTTPException(status_code=401, detail="Stale request timestamp")
+
         try:
-            payload = _json.loads(body)
-        except Exception:
+            payload = json.loads(body)
+        except ValueError:
             raise HTTPException(status_code=400, detail="Invalid JSON")
 
         interaction_type = payload.get("type")
@@ -65,10 +89,10 @@ def build_interaction_router(adapter: "DiscordGatewayAdapter") -> APIRouter:
         if interaction_type == _TYPE_PING:
             return JSONResponse({"type": 1})
 
-        # Route component interactions through the gateway
-        from core.components.messaging.gateway import messaging_gateway
+        # Route component interactions through the gateway using this adapter's
+        # actual provider_id (e.g. "discord" or "discord:ops").
         try:
-            await messaging_gateway.handle_incoming("discord", payload)
+            await messaging_gateway.handle_incoming(adapter.provider_id, payload)
         except Exception as exc:
             log.error("Discord router: handle_incoming raised: %s", exc)
 
@@ -76,6 +100,19 @@ def build_interaction_router(adapter: "DiscordGatewayAdapter") -> APIRouter:
         return JSONResponse({"type": 6})
 
     return router
+
+
+def _timestamp_is_fresh(timestamp: str) -> bool:
+    """Return True if the signed Discord timestamp is within the replay window.
+
+    Discord sends ``X-Signature-Timestamp`` as a Unix epoch (seconds). A
+    captured, validly-signed request can otherwise be replayed indefinitely.
+    """
+    try:
+        sent = float(timestamp)
+    except (TypeError, ValueError):
+        return False
+    return abs(time.time() - sent) <= _MAX_TIMESTAMP_SKEW
 
 
 def _verify_discord_signature(
@@ -94,7 +131,6 @@ def _verify_discord_signature(
     """
     try:
         from nacl.signing import VerifyKey
-        from nacl.exceptions import BadSignatureError
         key = VerifyKey(bytes.fromhex(public_key_hex))
         key.verify((timestamp.encode() + body), bytes.fromhex(signature_hex))
         return True
