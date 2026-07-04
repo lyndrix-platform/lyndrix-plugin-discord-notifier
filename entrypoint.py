@@ -29,7 +29,7 @@ from .app.ui.nicegui.settings import render_settings_ui as modular_settings_ui
 manifest = ModuleManifest(
     id="lyndrix.plugin.discord",
     name="Discord Notifier",
-    version="0.1.1",
+    version="0.2.0",
     description=(
         "Two-way Discord integration via the Lyndrix Messaging Gateway. "
         "Supports multiple channel instances via env vars."
@@ -37,7 +37,7 @@ manifest = ModuleManifest(
     author="Lyndrix",
     icon="notifications_active",
     type="PLUGIN",
-    min_core_version="0.1.1",
+    min_core_version="0.2.0",
     auto_enable_on_install=False,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-discord-notifier",
     permissions={

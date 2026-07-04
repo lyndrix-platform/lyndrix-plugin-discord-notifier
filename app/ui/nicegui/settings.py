@@ -53,16 +53,14 @@ def render_settings_ui(ctx, service, adapter=None) -> None:
         with ui.card().classes(f"{UIStyles.CARD_GLASS} w-full").style(
             "padding: 0; flex-wrap: nowrap"
         ):
-            ui.element("div").classes(
-                "h-1 w-full bg-gradient-to-r from-indigo-400 via-violet-400 to-purple-400"
-            )
+            ui.element("div").classes(UIStyles.GRAD_BAR_ACCENT)
             with ui.column().classes("w-full flex-grow p-5 gap-4"):
                 with ui.row().classes("items-center gap-2 mb-1"):
                     ui.icon("notifications_active", size="18px").classes(
-                        "text-indigo-400"
+                        "text-[var(--lx-accent-3)]"
                     )
                     ui.label("Benachrichtigungen").classes(
-                        "text-sm font-bold uppercase tracking-widest text-slate-300"
+                        "text-sm font-bold uppercase tracking-widest text-[var(--lx-text-muted)]"
                     )
                 ui.label("Konfiguration für System-Benachrichtigungen.").classes(
                     UIStyles.TEXT_MUTED
@@ -82,14 +80,12 @@ def render_settings_ui(ctx, service, adapter=None) -> None:
         with ui.card().classes(f"{UIStyles.CARD_GLASS} w-full").style(
             "padding: 0; flex-wrap: nowrap"
         ):
-            ui.element("div").classes(
-                "h-1 w-full bg-gradient-to-r from-emerald-400 via-teal-400 to-cyan-400"
-            )
+            ui.element("div").classes(UIStyles.GRAD_BAR_ACCENT)
             with ui.column().classes("w-full flex-grow p-5 gap-4"):
                 with ui.row().classes("items-center gap-2 mb-1"):
-                    ui.icon("smart_toy", size="18px").classes("text-emerald-400")
+                    ui.icon("smart_toy", size="18px").classes("text-[var(--lx-accent)]")
                     ui.label("Bot API (empfohlen)").classes(
-                        "text-sm font-bold uppercase tracking-widest text-slate-300"
+                        "text-sm font-bold uppercase tracking-widest text-[var(--lx-text-muted)]"
                     )
                 ui.label(
                     "Aktiviert In-Place-Edits von Nachrichten "
@@ -113,14 +109,12 @@ def render_settings_ui(ctx, service, adapter=None) -> None:
         with ui.card().classes(f"{UIStyles.CARD_GLASS} w-full").style(
             "padding: 0; flex-wrap: nowrap"
         ):
-            ui.element("div").classes(
-                "h-1 w-full bg-gradient-to-r from-sky-400 via-cyan-400 to-teal-400"
-            )
+            ui.element("div").classes(UIStyles.GRAD_BAR_ACCENT)
             with ui.column().classes("w-full flex-grow p-5 gap-4"):
                 with ui.row().classes("items-center gap-2 mb-1"):
-                    ui.icon("webhook", size="18px").classes("text-sky-400")
+                    ui.icon("webhook", size="18px").classes("text-[var(--lx-accent-2)]")
                     ui.label("Webhook (Fallback)").classes(
-                        "text-sm font-bold uppercase tracking-widest text-slate-300"
+                        "text-sm font-bold uppercase tracking-widest text-[var(--lx-text-muted)]"
                     )
                 ui.label(
                     "Wird nur verwendet, wenn keine Bot API konfiguriert ist. "
