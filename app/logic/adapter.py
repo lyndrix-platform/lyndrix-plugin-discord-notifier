@@ -527,26 +527,3 @@ class DiscordGatewayAdapter(GatewayAdapter):
             user_id=user_id,
             metadata={"raw_interaction": raw},
         )
-
-    # ------------------------------------------------------------------
-    # Legacy bridge (used by entrypoint during migration period)
-    # ------------------------------------------------------------------
-
-    async def legacy_send_notification(self, payload: dict) -> None:
-        """Translate a ``notification:outbound`` payload and send it directly.
-
-        Deprecated. Kept for backward compatibility until all callers have
-        been migrated to ``messaging:outbound``.
-        """
-        severity_map = {
-            "positive": MessageSeverity.SUCCESS,
-            "negative": MessageSeverity.ERROR,
-            "warning":  MessageSeverity.WARNING,
-        }
-        msg = OutboundMessage(
-            title=payload.get("title") or "Lyndrix",
-            body=payload.get("message") or "",
-            severity=severity_map.get(payload.get("type", "info"), MessageSeverity.INFO),
-            source_plugin_id="lyndrix.plugin.discord",
-        )
-        await self.send(msg)
