@@ -42,6 +42,23 @@ manifest = ModuleManifest(
         "subscribe": ["system:boot_complete"],
         "emit": [],
     },
+    # Identity & Permissions 2.0 roles. Permissions are fully qualified
+    # (plugin:<id>:api:*) rather than the bare global api:read/write, so
+    # granting these roles only ever affects this plugin.
+    roles=[
+        {"id": "viewer", "label": "Discord Notifier Viewer",
+         "permissions": ["plugin:lyndrix.plugin.discord:api:read"],
+         "auto_map_groups": [],
+         "description": "Read-only access to Discord notifier status and config."},
+        {"id": "operator", "label": "Discord Notifier Operator",
+         "permissions": ["plugin:lyndrix.plugin.discord:api:read", "plugin:lyndrix.plugin.discord:api:write"],
+         "auto_map_groups": [],
+         "description": "Manage Discord notifier configuration and adapters."},
+        {"id": "admin", "label": "Discord Notifier Administrator",
+         "permissions": ["plugin:lyndrix.plugin.discord:api:read", "plugin:lyndrix.plugin.discord:api:write"],
+         "auto_map_groups": ["INT_ADMIN"],
+         "description": "Full control over the Discord notifier plugin."},
+    ],
 )
 
 # Module-level state — populated in setup()
@@ -84,7 +101,12 @@ def setup(ctx):
     # TODO(agent): derive the instance from a path/query segment if true
     # per-instance inbound routing is ever required.
     if _adapters:
-        ctx.register_routes(build_interaction_router(_adapters[0]))
+        # public=True: this is Discord's unauthenticated Interactions webhook
+        # endpoint — it must be reachable without the core's require_api_auth
+        # dependency. The handler self-authenticates via Ed25519 signature
+        # verification (app/api/router.py:118), which fails closed on any
+        # missing/invalid signature, so this is not an open route.
+        ctx.register_routes(build_interaction_router(_adapters[0]), public=True)
 
     _service = DiscordNotifierService(ctx)
 
