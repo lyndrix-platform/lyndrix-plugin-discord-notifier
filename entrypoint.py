@@ -27,7 +27,7 @@ from .app.logic.service import DiscordNotifierService
 manifest = ModuleManifest(
     id="lyndrix.plugin.discord",
     name="Discord Notifier",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Two-way Discord integration via the Lyndrix Messaging Gateway. "
         "Supports multiple channel instances via env vars."
