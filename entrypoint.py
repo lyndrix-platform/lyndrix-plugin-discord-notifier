@@ -27,7 +27,7 @@ from .app.logic.service import DiscordNotifierService
 manifest = ModuleManifest(
     id="lyndrix.plugin.discord",
     name="Discord Notifier",
-    version="1.1.0",
+    version="1.1.1",
     description=(
         "Two-way Discord integration via the Lyndrix Messaging Gateway. "
         "Supports multiple channel instances via env vars."
@@ -106,7 +106,18 @@ def setup(ctx):
         # dependency. The handler self-authenticates via Ed25519 signature
         # verification (app/api/router.py:118), which fails closed on any
         # missing/invalid signature, so this is not an open route.
-        ctx.register_routes(build_interaction_router(_adapters[0]), public=True)
+        try:
+            ctx.register_routes(build_interaction_router(_adapters[0]), public=True)
+        except TypeError:
+            # Older core (< 1.1.0) has no public-route parameter. The Interactions
+            # webhook only works unauthenticated, so mounting it behind
+            # require_api_auth would just 401 Discord — skip it instead of aborting
+            # setup. Outbound notifications keep working; slash-command/button
+            # interactions need core >= 1.1.0.
+            ctx.log.warning(
+                "Discord Notifier: core lacks public-route support (needs >= 1.1.0); "
+                "Interactions webhook NOT mounted. Outbound notifications still work."
+            )
 
     _service = DiscordNotifierService(ctx)
 
