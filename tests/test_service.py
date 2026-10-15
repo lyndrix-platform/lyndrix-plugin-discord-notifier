@@ -1,6 +1,5 @@
+import asyncio
 import logging
-
-import pytest
 
 from app.logic.adapter import DiscordGatewayAdapter, _truncate
 from app.logic.service import DiscordNotifierService
@@ -30,10 +29,9 @@ class StubCtx:
         return coro
 
 
-def test_service_starts_with_zero_sent():
+def test_service_without_db_reports_no_tracked_messages():
     service = DiscordNotifierService(StubCtx())
-    assert service.state["notifications_sent"] == 0
-    assert service.notifications_sent == 0
+    assert asyncio.run(service.tracked_messages()) is None
 
 
 def test_truncate_appends_ellipsis_when_over_limit():
@@ -67,8 +65,7 @@ def test_save_config_rejects_invalid_webhook_url():
     )
 
 
-@pytest.mark.asyncio
-async def test_handle_incoming_routes_component_with_correlation():
+def test_handle_incoming_routes_component_with_correlation():
     adapter = DiscordGatewayAdapter(StubCtx(), instance_id="ops")
     corr = "123e4567-e89b-12d3-a456-426614174000"
     raw = {
@@ -76,7 +73,7 @@ async def test_handle_incoming_routes_component_with_correlation():
         "data": {"custom_id": f"approve:{corr}"},
         "member": {"user": {"id": "42"}},
     }
-    inbound = await adapter.handle_incoming(raw)
+    inbound = asyncio.run(adapter.handle_incoming(raw))
     assert inbound is not None
     assert inbound.provider_id == "discord:ops"
     assert inbound.action_id == "approve"
@@ -84,7 +81,6 @@ async def test_handle_incoming_routes_component_with_correlation():
     assert inbound.user_id == "42"
 
 
-@pytest.mark.asyncio
-async def test_handle_incoming_ignores_ping():
+def test_handle_incoming_ignores_ping():
     adapter = DiscordGatewayAdapter(StubCtx())
-    assert await adapter.handle_incoming({"type": 1}) is None
+    assert asyncio.run(adapter.handle_incoming({"type": 1})) is None

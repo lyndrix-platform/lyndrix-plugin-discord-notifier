@@ -15,10 +15,15 @@ Configuration is managed exclusively through the generic provider-config
 surface (``ProviderConfigField`` → ``GET/PATCH /api/notifications/providers/
 discord/config``), rendered by both the notification-router settings card and
 the React NotificationsSection — this plugin ships no bespoke settings UI.
+
+Cluster mode: every core instance must carry identical ``LYNDRIX_GATEWAY_*``
+env vars (same adapter set on every instance). The notification → Discord
+message map is shared through the database table ``discord_messages``.
 """
+import asyncio
 import time
 
-from core.api import ModuleManifest, PluginHealthStatus
+from core.api import ModuleManifest, PluginHealthStatus, db_instance
 
 from .app.api.router import build_interaction_router
 from .app.logic.adapter import DiscordGatewayAdapter
@@ -27,7 +32,7 @@ from .app.logic.service import DiscordNotifierService
 manifest = ModuleManifest(
     id="lyndrix.plugin.discord",
     name="Discord Notifier",
-    version="1.1.1",
+    version="1.2.0",
     description=(
         "Two-way Discord integration via the Lyndrix Messaging Gateway. "
         "Supports multiple channel instances via env vars."
@@ -39,9 +44,17 @@ manifest = ModuleManifest(
     auto_enable_on_install=False,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-discord-notifier",
     permissions={
-        "subscribe": ["system:boot_complete"],
+        "subscribe": ["system:boot_complete", "db:connected"],
         "emit": [],
     },
+    # Core schema-driven settings dialog (stored in Vault, read via ctx.get_setting).
+    settings_schema=[
+        {"key": "message_retention_days", "label": "Message map retention (days)", "kind": "int",
+         "category": "Storage", "default": "30",
+         "description": "Notification → Discord message mappings not updated for this long are pruned "
+                        "(by the leader instance, at most hourly). Older notifications are posted as "
+                        "new messages instead of being edited."},
+    ],
     # Identity & Permissions 2.0 roles. Permissions are fully qualified
     # (plugin:<id>:api:*) rather than the bare global api:read/write, so
     # granting these roles only ever affects this plugin.
@@ -66,13 +79,25 @@ _adapters: list[DiscordGatewayAdapter] = []
 _service:  DiscordNotifierService | None = None
 
 
+def _spawn(ctx, coro) -> None:
+    """Start background work via ctx.create_task (older cores: the running loop)."""
+    create_task = getattr(ctx, "create_task", None)
+    if callable(create_task):
+        create_task(coro, name="discord:bootstrap")
+    else:
+        asyncio.get_running_loop().create_task(coro)
+
+
 def setup(ctx):
     global _adapters, _service
     _adapters = []
+    _service = DiscordNotifierService(ctx)
 
     # TODO(agent): `settings.gateway_provider_specs` has no `core.api` surface;
     # importing from `config` couples the plugin to core internals. Expose this
     # via core.api (or ctx) so this import can be dropped.
+    # Cluster: the specs come from this instance's env — every instance needs
+    # identical LYNDRIX_GATEWAY_* variables or their adapter sets diverge.
     from config import settings
 
     # Build adapter list from LYNDRIX_GATEWAY_PROVIDERS, or fall back to a
@@ -81,7 +106,7 @@ def setup(ctx):
 
     if discord_specs:
         for spec in discord_specs:
-            adapter = DiscordGatewayAdapter(ctx, instance_id=spec["instance_id"])
+            adapter = DiscordGatewayAdapter(ctx, instance_id=spec["instance_id"], store=_service.store)
             ctx.register_gateway_adapter(adapter)
             _adapters.append(adapter)
             ctx.log.info(
@@ -90,7 +115,7 @@ def setup(ctx):
             )
     else:
         # Default single-instance mode — reads webhook_url from Vault
-        adapter = DiscordGatewayAdapter(ctx, instance_id="default")
+        adapter = DiscordGatewayAdapter(ctx, instance_id="default", store=_service.store)
         ctx.register_gateway_adapter(adapter)
         _adapters.append(adapter)
         ctx.log.info("Discord Notifier: registered default instance.")
@@ -119,7 +144,22 @@ def setup(ctx):
                 "Interactions webhook NOT mounted. Outbound notifications still work."
             )
 
-    _service = DiscordNotifierService(ctx)
+    # db:connected fires BEFORE setup() on a normal boot (it triggers plugin
+    # activation), so bootstrap right away when the DB is already up; the
+    # subscription covers reconnects and late connections. DDL runs in a thread
+    # under the core's bootstrap advisory lock.
+    service = _service
+
+    async def _initial_bootstrap():
+        if db_instance.is_connected and await service.bootstrap():
+            ctx.log.info("Discord Notifier: message store ready (DB was already connected).")
+
+    _spawn(ctx, _initial_bootstrap())
+
+    @ctx.subscribe("db:connected")
+    async def _on_db_connected(payload):
+        if await service.bootstrap():
+            ctx.log.info("Discord Notifier: message store ready.")
 
     @ctx.subscribe("system:boot_complete")
     async def _on_boot(payload):
@@ -160,11 +200,16 @@ async def health(ctx) -> PluginHealthStatus:
     configured = [pid for pid, ok in results if ok]
     unconfigured = [pid for pid, ok in results if not ok]
     latency = round((time.perf_counter() - start) * 1000, 1)
+    try:
+        tracked = await _service.tracked_messages()
+    except Exception:
+        tracked = None
     details = {
         "adapters_total": len(_adapters),
         "adapters_configured": len(configured),
         "unconfigured": unconfigured,
-        "notifications_sent": _service.state.get("notifications_sent", 0),
+        # Shared across instances; None = no DB (edits stay per instance).
+        "tracked_messages": tracked,
     }
 
     # No adapter has a usable transport yet. This is an *unconfigured* state

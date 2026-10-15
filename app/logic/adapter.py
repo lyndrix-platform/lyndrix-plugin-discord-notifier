@@ -19,6 +19,19 @@ adapter inspects the ``Retry-After`` response header on HTTP 429 and sleeps
 inside the background thread before retrying once.  Further back-off is
 handled by the gateway's ``_AdapterRetryWorker``.
 
+The 429 back-off is per core instance: N instances sharing one bot token / webhook
+each see (and wait out) their own rate-limit responses — Discord's limit is not
+coordinated across the cluster.
+
+Cluster mode
+------------
+The notification_id → Discord message id map lives in the shared database
+(``discord_messages``, see ``message_store.py``), so whichever instance handles
+an update edits the original message. Every instance must carry identical
+``LYNDRIX_GATEWAY_*`` env vars, otherwise instances register different adapter
+sets and a notification routed to ``discord:ops`` is dropped on an instance
+that lacks that adapter.
+
 Payload limits (enforced via _truncate())
 ------------------------------------------
 - Embed title:       256 chars
@@ -46,6 +59,8 @@ from core.api import (
     OutboundMessage,
     ProviderConfigField,
 )
+
+from .message_store import MessageStore
 
 log = logging.getLogger("Plugin:DiscordAdapter")
 
@@ -78,9 +93,9 @@ _EMBED_FIELDS_MAX      = 25
 _BUTTON_LABEL_MAX      = 80
 _HTTP_TIMEOUT          = 15   # seconds per request inside asyncio.to_thread
 
-# In-memory message ID store retention: long enough for a pipeline run, but
-# bounded so the store does not grow without bound across reboots.
-_MSG_STORE_TTL = 86400  # 24 hours
+# get_config_fields() is called synchronously by the core from async routes, so
+# it serves Vault values cached by the off-thread config reads for this long.
+_VAULT_CACHE_TTL = 120.0
 
 
 def _truncate(s: str, limit: int) -> str:
@@ -127,34 +142,21 @@ class DiscordGatewayAdapter(GatewayAdapter):
     # Discord webhooks are fast; 20 s is generous but avoids gateway timeout.
     send_timeout: ClassVar[float] = 20.0
 
-    def __init__(self, ctx: ModuleContext, instance_id: str = "default") -> None:
+    def __init__(
+        self,
+        ctx: ModuleContext,
+        instance_id: str = "default",
+        store: MessageStore | None = None,
+    ) -> None:
         self._ctx         = ctx
         self._instance_id = instance_id
         self.provider_id  = "discord" if instance_id == "default" else f"discord:{instance_id}"
-        # notification_id → (discord_message_id, monotonic_created_time).
-        # Used by the Bot API path to PATCH a previously created message
-        # instead of POSTing a new one (live-updating notifications).
-        self._message_store: dict[str, tuple[str, float]] = {}
-
-    # ------------------------------------------------------------------
-    # Bot API message ID store (per-instance, in-memory)
-    # ------------------------------------------------------------------
-
-    def _get_stored_message_id(self, notification_id: str) -> str | None:
-        entry = self._message_store.get(notification_id)
-        if entry and (time.monotonic() - entry[1]) < _MSG_STORE_TTL:
-            return entry[0]
-        # Either missing or expired — drop and report miss.
-        self._message_store.pop(notification_id, None)
-        return None
-
-    def _store_message_id(self, notification_id: str, discord_message_id: str) -> None:
-        self._message_store[notification_id] = (discord_message_id, time.monotonic())
-        # Opportunistic cleanup of expired entries to keep the dict bounded.
-        now = time.monotonic()
-        expired = [k for k, (_, t) in self._message_store.items() if now - t > _MSG_STORE_TTL]
-        for k in expired:
-            del self._message_store[k]
+        # notification_id → Discord message id, shared across core instances
+        # (DB-backed). Used by the Bot API path to PATCH a previously created
+        # message instead of POSTing a new one (live-updating notifications).
+        self._store = store if store is not None else MessageStore(ctx)
+        # Vault key → (value, monotonic read time); see _VAULT_CACHE_TTL.
+        self._vault_cache: dict[str, tuple[str | None, float]] = {}
 
     # ------------------------------------------------------------------
     # Config helpers
@@ -183,7 +185,27 @@ class DiscordGatewayAdapter(GatewayAdapter):
         env_val = os.getenv(f"{self._env_prefix()}_{key.upper()}")
         if env_val:
             return env_val
-        return self._ctx.get_secret(self._vault_key(key))
+        return self._read_vault(self._vault_key(key))
+
+    def _read_vault(self, vault_key: str) -> str | None:
+        """Blocking Vault read that also refreshes the config-field cache."""
+        value = self._ctx.get_secret(vault_key)
+        self._vault_cache[vault_key] = (value, time.monotonic())
+        return value
+
+    def _cached_vault(self, vault_key: str) -> str | None:
+        """Vault value for get_config_fields(): cached when fresh, else read.
+
+        The cache is warmed off-thread by health()/send() (the dashboard polls
+        health), so the synchronous read on the core's event loop only happens
+        on a cold cache.
+        """
+        # TODO(agent): the core calls get_config_fields() synchronously from async
+        # routes (notification_router/api.py); offload it there and drop this cache.
+        entry = self._vault_cache.get(vault_key)
+        if entry and time.monotonic() - entry[1] < _VAULT_CACHE_TTL:
+            return entry[0]
+        return self._read_vault(vault_key)
 
     # ------------------------------------------------------------------
     # ProviderConfigField API (used by notification router settings UI)
@@ -200,7 +222,7 @@ class DiscordGatewayAdapter(GatewayAdapter):
         ]:
             env_var   = f"{prefix}_{setting}"
             env_val   = os.getenv(env_var)
-            vault_val = self._ctx.get_secret(self._vault_key(setting)) if not env_val else None
+            vault_val = self._cached_vault(self._vault_key(setting)) if not env_val else None
             fields.append(ProviderConfigField(
                 key=self._vault_key(setting),
                 label=label,
@@ -222,7 +244,10 @@ class DiscordGatewayAdapter(GatewayAdapter):
                     self._instance_id,
                 )
                 return False
-        return self._ctx.set_secret(key, value)
+        ok = self._ctx.set_secret(key, value)
+        if ok:
+            self._vault_cache[key] = (value, time.monotonic())
+        return ok
 
     # ------------------------------------------------------------------
     # Health check
@@ -237,8 +262,11 @@ class DiscordGatewayAdapter(GatewayAdapter):
         return await asyncio.to_thread(self._health_sync)
 
     def _health_sync(self) -> bool:
-        has_bot_api = bool(self._get_config("bot_token") and self._get_config("channel_id"))
-        has_webhook = bool(self._get_config("webhook_url"))
+        # Read every field (not short-circuited) so the config-field cache used
+        # by get_config_fields() stays warm — see _cached_vault().
+        cfg = {k: self._get_config(k) for k in ("bot_token", "channel_id", "webhook_url", "bot_name")}
+        has_bot_api = bool(cfg["bot_token"] and cfg["channel_id"])
+        has_webhook = bool(cfg["webhook_url"])
         return has_bot_api or has_webhook
 
     # ------------------------------------------------------------------
@@ -318,9 +346,10 @@ class DiscordGatewayAdapter(GatewayAdapter):
         }
         base_url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
 
-        # Try to edit an existing message first.
+        # Try to edit an existing message first (the id may have been stored by
+        # another core instance — the store is DB-backed).
         if notification_id:
-            existing_id = self._get_stored_message_id(str(notification_id))
+            existing_id = self._store.get(self.provider_id, str(notification_id), str(channel_id))
             if existing_id:
                 edit_url = f"{base_url}/{existing_id}"
                 try:
@@ -343,8 +372,8 @@ class DiscordGatewayAdapter(GatewayAdapter):
                     "Discord [%s]: edit failed (HTTP %s) — creating new message instead.",
                     self._instance_id, resp.status_code,
                 )
-                # Drop the stale id so we don't keep PATCHing it.
-                self._message_store.pop(str(notification_id), None)
+                # Drop the stale id so no instance keeps PATCHing it.
+                self._store.forget(self.provider_id, str(notification_id))
 
         # POST a new message (and remember its id if we have a notification_id).
         resp = self._post_with_rate_limit(base_url, payload, headers)
@@ -360,7 +389,7 @@ class DiscordGatewayAdapter(GatewayAdapter):
                 )
                 return None
             if notification_id:
-                self._store_message_id(str(notification_id), discord_msg_id)
+                self._store.put(self.provider_id, str(notification_id), str(channel_id), discord_msg_id)
             log.debug(
                 "Discord [%s]: created message %s.",
                 self._instance_id, discord_msg_id,

@@ -28,6 +28,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now persisted and its default matches the adapter (`Lyndrix`).
 - Rewrote the broken test suite against the current adapter/service API.
 
+## [1.2.0] - 2026-10-15
+### Changed
+- Cluster readiness: the notification → Discord message id map moved from process
+  memory into the shared DB table `discord_messages` (PK `notification_id` +
+  `provider_id`, with `channel_id`, `discord_message_id`, `created_at`,
+  `updated_at`). An update handled by another core instance — or after a restart —
+  now edits the original message instead of posting a new one. A 60 s per-process
+  cache sits in front; without a DB the plugin falls back to the old in-memory map.
+- Table creation is idempotent and serialized by the core's `lyndrix_bootstrap`
+  advisory lock; it runs at setup when the DB is already connected and again on
+  every `db:connected`. Writes use READ COMMITTED sessions and retry MariaDB
+  1020/1205/1213; a concurrent insert of the same key is tolerated.
+- `get_config_fields()` (called synchronously by the core) serves Vault values
+  cached by the off-thread `health()`/`send()` reads instead of hitting Vault on
+  the event loop every time.
+
+### Added
+- Setting `message_retention_days` (default 30): mappings not updated for that long
+  are pruned by the leader instance (at most hourly, piggy-backed on writes).
+- `health()` reports `tracked_messages` (row count of `discord_messages`).
+
+### Removed
+- The per-process `notifications_sent` counter (never incremented); `health()` no
+  longer reports it.
+
+### Notes
+- Every instance needs identical `LYNDRIX_GATEWAY_*` env vars; 429 back-off is
+  per instance (not coordinated across the cluster).
+
 ## [0.1.0] - 2026-05-26
 ### Changed
 - Refactored to the new Lyndrix Core plugin standard (`./app/` sub-package layout).
