@@ -343,3 +343,42 @@ def test_pending_placeholder_fits_the_column_and_discords_nonce_limit(db):
     claim = _store().claim("discord", "n-1", "chan")
     assert len(PENDING_PREFIX + claim.nonce) <= DiscordMessage.discord_message_id.type.length
     assert len(claim.nonce) <= 25
+
+
+# --- DN-05: config reads are cached --------------------------------------------------
+
+def test_health_and_send_do_not_read_vault_every_time(db, monkeypatch, clock):
+    ctx = _Ctx(_SECRETS)
+    adapter = DiscordGatewayAdapter(ctx, store=_store())
+    _Discord(monkeypatch)
+
+    assert adapter._health_sync() is True
+    cold = ctx.reads                    # bot_token, channel_id, webhook_url, bot_name
+    assert cold == 4
+    for _ in range(20):
+        assert adapter._health_sync() is True
+        assert adapter._send_sync(_message()) is not None
+    assert ctx.reads == cold
+
+    clock.now += adapter_mod._VAULT_CACHE_TTL + 1
+    adapter._health_sync()
+    assert ctx.reads == cold + 4        # refreshed after the TTL
+
+
+def test_rejected_token_drops_the_config_cache(db, monkeypatch, clock):
+    ctx = _Ctx(_SECRETS)
+    adapter = DiscordGatewayAdapter(ctx, store=_store())
+    _Discord(monkeypatch, post=[_Resp(401)])
+    assert adapter._send_sync(_message()) is None
+    ctx.secrets["bot_token"] = "dummy-rotated-token-not-real"
+    reads = ctx.reads
+    assert adapter._send_sync(_message()) is not None
+    assert ctx.reads > reads            # the rotated token was re-read
+
+
+def test_saved_config_is_visible_immediately(db, clock):
+    ctx = _Ctx({})
+    adapter = DiscordGatewayAdapter(ctx, store=_store())
+    assert adapter._health_sync() is False
+    assert adapter.save_config("webhook_url", "https://discord.com/api/webhooks/1/dummy-token-not-real")
+    assert adapter._health_sync() is True

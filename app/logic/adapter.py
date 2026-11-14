@@ -116,8 +116,12 @@ _CLAIM_WAIT_MAX        = 5.0
 
 _EDIT_OK, _EDIT_GONE, _EDIT_RETRY = "ok", "gone", "retry"
 
-# get_config_fields() is called synchronously by the core from async routes, so
-# it serves Vault values cached by the off-thread config reads for this long.
+# Vault-backed config values are served from a per-adapter cache for this long:
+# health() is polled by every dashboard on every instance and send() runs per
+# message — neither should cost hvac round trips each time. get_config_fields()
+# (called synchronously by the core from async routes) uses the same cache.
+# A value saved on this instance is visible at once (save_config), a rejected
+# token (401/403) drops the cache, peers follow within the TTL.
 _VAULT_CACHE_TTL = 120.0
 
 
@@ -273,11 +277,11 @@ class DiscordGatewayAdapter(GatewayAdapter):
         return self._vault_key(setting)
 
     def _get_config(self, key: str) -> str | None:
-        """Read a per-instance config value: env var first, then Vault."""
+        """Read a per-instance config value: env var first, then Vault (cached)."""
         env_val = os.getenv(f"{self._env_prefix()}_{key.upper()}")
         if env_val:
             return env_val
-        return self._read_vault(self._vault_key(key))
+        return self._cached_vault(self._vault_key(key))
 
     def _read_vault(self, vault_key: str) -> str | None:
         """Blocking Vault read that also refreshes the config-field cache."""
@@ -286,11 +290,11 @@ class DiscordGatewayAdapter(GatewayAdapter):
         return value
 
     def _cached_vault(self, vault_key: str) -> str | None:
-        """Vault value for get_config_fields(): cached when fresh, else read.
+        """Vault value: cached when fresh (``_VAULT_CACHE_TTL``), else read.
 
-        The cache is warmed off-thread by health()/send() (the dashboard polls
-        health), so the synchronous read on the core's event loop only happens
-        on a cold cache.
+        health()/send() call this off-thread and keep the cache warm, so the
+        synchronous get_config_fields() read on the core's event loop only
+        happens on a cold cache.
         """
         # TODO(agent): the core calls get_config_fields() synchronously from async
         # routes (notification_router/api.py); offload it there and drop this cache.
@@ -355,7 +359,8 @@ class DiscordGatewayAdapter(GatewayAdapter):
 
     def _health_sync(self) -> bool:
         # Read every field (not short-circuited) so the config-field cache used
-        # by get_config_fields() stays warm — see _cached_vault().
+        # by get_config_fields() stays warm — see _cached_vault(). Within the
+        # TTL this costs no Vault read at all (audit DN-05).
         cfg = {k: self._get_config(k) for k in ("bot_token", "channel_id", "webhook_url", "bot_name")}
         has_bot_api = bool(cfg["bot_token"] and cfg["channel_id"])
         has_webhook = bool(cfg["webhook_url"])
