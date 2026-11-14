@@ -148,6 +148,119 @@ def test_prune_is_leader_only_and_respects_retention(db):
     assert leader.count() == 1
 
 
+def test_retention_runs_without_the_leader_ever_sending(db, monkeypatch):
+    """DN-06: the sender is a non-leader, the leader never sends — rows are
+    pruned by the leased task anyway, and sending itself never prunes."""
+    import asyncio
+
+    from app.logic import service as service_mod
+
+    sender = _store(_Ctx(leader=False))
+    sender.put("discord", "old", "chan", "1")
+    with db.SessionLocal() as s:
+        s.execute(update(DiscordMessage).where(DiscordMessage.notification_id == "old")
+                  .values(updated_at=datetime.utcnow() - timedelta(days=31)))
+        s.commit()
+    sender._last_prune = 0.0
+    sender.put("discord", "new", "chan", "2")
+    assert sender.count() == 2                       # put() no longer prunes
+
+    holder_ctx = _Ctx(leader=False)                  # lease holder != core leader
+    service = service_mod.DiscordNotifierService(holder_ctx)
+    service.store.bootstrap()
+    monkeypatch.setattr(service_mod, "_PRUNE_FIRST_DELAY", 0.01)
+    monkeypatch.setattr(service_mod, "_PRUNE_INTERVAL", 0.01)
+
+    async def scenario():
+        await service.start_pruner()
+        first = service._prune_task
+        await service.start_pruner()                 # idempotent
+        assert service._prune_task is first
+        for _ in range(100):
+            if sender.count() == 1:
+                break
+            await asyncio.sleep(0.01)
+        await service.stop_pruner()                  # lease lost
+        assert first.cancelled() or first.done()
+        assert service._prune_task is None
+
+    asyncio.run(scenario())
+    assert sender.count() == 1
+    assert _store().get("discord", "new", "chan") == "2"
+
+
+class _SetupCtx(_Ctx):
+    """Enough of ModuleContext for entrypoint.setup()."""
+
+    def __init__(self, *, with_lease=True):
+        super().__init__()
+        self.leases, self.tasks, self.topics = {}, [], []
+        if with_lease:
+            self.on_lease = lambda name, acquired=None, lost=None: self.leases.update({name: (acquired, lost)})
+
+    def register_gateway_adapter(self, adapter):
+        pass
+
+    def register_routes(self, router, public=False):
+        pass
+
+    def subscribe(self, topic):
+        self.topics.append(topic)
+        return lambda fn: fn
+
+    def create_task(self, coro, name=None):
+        import asyncio
+
+        task = asyncio.get_running_loop().create_task(coro)
+        self.tasks.append(task)
+        return task
+
+
+def _entrypoint():
+    import importlib
+    import sys
+    import types
+    from pathlib import Path
+
+    if "discord_plugin" not in sys.modules:
+        pkg = types.ModuleType("discord_plugin")
+        pkg.__path__ = [str(Path(__file__).resolve().parents[1])]
+        sys.modules["discord_plugin"] = pkg
+    return importlib.import_module("discord_plugin.entrypoint")
+
+
+@pytest.mark.parametrize("with_lease", [True, False])
+def test_setup_runs_retention_under_a_lease_or_directly_on_old_cores(with_lease):
+    import asyncio
+
+    entry = _entrypoint()
+
+    async def scenario():
+        ctx = _SetupCtx(with_lease=with_lease)
+        entry.setup(ctx)
+        service = entry._service
+        await asyncio.sleep(0)                       # let spawned coroutines start
+        if with_lease:
+            acquired, lost = ctx.leases["discord:prune"]
+            assert service._prune_task is None       # nothing runs before the lease is ours
+            await acquired()
+            assert service._prune_task is not None
+            await lost()
+            assert service._prune_task is None
+        else:
+            assert service._prune_task is not None   # single instance: started right away
+            await service.stop_pruner()
+        for task in ctx.tasks:
+            task.cancel()
+        await asyncio.gather(*ctx.tasks, return_exceptions=True)
+        assert "plugin:settings_changed" in ctx.topics
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        entry._adapters, entry._service = [], None
+
+
 def _message(nid: str) -> OutboundMessage:
     return OutboundMessage(title="t", body="b", metadata={"notification_id": nid})
 

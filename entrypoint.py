@@ -27,7 +27,7 @@ from core.api import ModuleManifest, PluginHealthStatus, db_instance
 
 from .app.api.router import build_interaction_router
 from .app.logic.adapter import DiscordGatewayAdapter
-from .app.logic.service import PUBLIC_KEY_SETTING, DiscordNotifierService
+from .app.logic.service import PRUNE_LEASE, PUBLIC_KEY_SETTING, DiscordNotifierService
 
 manifest = ModuleManifest(
     id="lyndrix.plugin.discord",
@@ -60,7 +60,7 @@ manifest = ModuleManifest(
         {"key": "message_retention_days", "label": "Message map retention (days)", "kind": "int",
          "category": "Storage", "default": "30",
          "description": "Notification → Discord message mappings not updated for this long are pruned "
-                        "(by the leader instance, at most hourly). Older notifications are posted as "
+                        "(hourly, by one instance under the discord:prune lease). Older notifications are posted as "
                         "new messages instead of being edited."},
     ],
     # Identity & Permissions 2.0 roles. Permissions are fully qualified
@@ -168,6 +168,15 @@ def setup(ctx):
     async def _on_db_connected(payload):
         if await service.bootstrap():
             ctx.log.info("Discord Notifier: message store ready.")
+
+    # Retention runs on exactly one instance under its own lease — independent
+    # of which instance happens to send (audit DN-06). Older cores without
+    # ctx.on_lease are single-instance: just start it.
+    on_lease = getattr(ctx, "on_lease", None)
+    if callable(on_lease):
+        on_lease(PRUNE_LEASE, acquired=service.start_pruner, lost=service.stop_pruner)
+    else:
+        _spawn(ctx, service.start_pruner())
 
     @ctx.subscribe("plugin:settings_changed")
     async def _on_settings_changed(payload):

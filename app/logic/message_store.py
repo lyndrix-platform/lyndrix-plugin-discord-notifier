@@ -41,7 +41,8 @@ DEFAULT_RETENTION_DAYS = 30
 # mapping a peer replaced (edit failed → new message) is picked up quickly.
 _CACHE_TTL = 60.0
 _CACHE_MAX = 512
-# The leader prunes at most this often (per instance, piggy-backed on writes).
+# Retention pass interval (the service's leased background task, see
+# DiscordNotifierService.start_pruner).
 _PRUNE_INTERVAL = 3600.0
 
 # Placeholder value of ``discord_message_id`` while an instance is creating the
@@ -173,8 +174,6 @@ class MessageStore:
                 retry_write(_upsert)
         except Exception as exc:
             log.warning(f"Discord store: could not persist message id ({exc!s:.160})")
-            return
-        self.maybe_prune()
 
     def claim(self, provider_id: str, notification_id: str, channel_id: str | None) -> Claim:
         """Reserve the right to create the message for this notification.
@@ -333,8 +332,18 @@ class MessageStore:
             days = DEFAULT_RETENTION_DAYS
         return max(days, 1)
 
+    def prune_expired(self) -> int:
+        """One retention pass with the configured retention (blocking: Vault + DB)."""
+        self._last_prune = time.monotonic()
+        return self.prune(self._retention_days())
+
     def maybe_prune(self) -> int:
-        """Leader-only, throttled retention pass (piggy-backed on writes)."""
+        """Leader-only, throttled retention pass.
+
+        No longer called from put(): pruning piggy-backed on the leader's own
+        sends never ran when another instance did the sending. Kept for callers
+        without the leased task (see DiscordNotifierService.start_pruner).
+        """
         if time.monotonic() - self._last_prune < _PRUNE_INTERVAL:
             return 0
         # Single mode: the only instance is always the leader.

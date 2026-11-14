@@ -13,7 +13,7 @@ import time
 
 from core.api import get_logger
 
-from .message_store import MessageStore
+from .message_store import _PRUNE_INTERVAL, MessageStore
 
 log = get_logger("Plugin:Discord:Service")
 
@@ -26,6 +26,12 @@ LEGACY_PUBLIC_KEY_SECRET = "discord_public_key"
 # the key. Cached so an anonymous flood costs no Vault round trips; short enough
 # that a peer instance picks up a change even if the settings event is lost.
 PUBLIC_KEY_TTL = 60.0
+
+# Lease that elects the one instance running the retention pass.
+PRUNE_LEASE = "discord:prune"
+# First pass shortly after start (the DB bootstrap has finished by then), then
+# every _PRUNE_INTERVAL.
+_PRUNE_FIRST_DELAY = 120.0
 _PUBLIC_KEY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -95,6 +101,7 @@ class DiscordNotifierService:
         self.ctx = ctx
         self.store = MessageStore(ctx)
         self.public_key = PublicKeyCache(ctx)
+        self._prune_task: asyncio.Task | None = None
 
     async def bootstrap(self) -> bool:
         """Create the table off the event loop; ``False`` (logged) on failure."""
@@ -106,6 +113,44 @@ class DiscordNotifierService:
             if log is not None:
                 log.error(f"Discord Notifier: DB init failed — {exc}")
             return False
+
+    # ── retention (exactly one instance, independent of who sends) ────────────
+
+    async def start_pruner(self) -> None:
+        """Lease acquired (or single instance) → prune periodically in the background."""
+        task = self._prune_task
+        if task is not None and not task.done():
+            return
+        create_task = getattr(self.ctx, "create_task", None)
+        coro = self._prune_loop()
+        # ctx.create_task ties the task to the plugin (cancelled on unload).
+        self._prune_task = create_task(coro, name=PRUNE_LEASE) if callable(create_task) \
+            else asyncio.get_running_loop().create_task(coro)
+
+    async def stop_pruner(self) -> None:
+        """Lease lost / plugin unloaded → stop at once; a peer takes over."""
+        task, self._prune_task = self._prune_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _prune_loop(self) -> None:
+        delay = _PRUNE_FIRST_DELAY
+        while True:
+            await asyncio.sleep(delay)
+            delay = _PRUNE_INTERVAL
+            await self.prune_once()
+
+    async def prune_once(self) -> int:
+        """One retention pass off the event loop; never raises."""
+        try:
+            return await asyncio.to_thread(self.store.prune_expired)
+        except Exception as exc:  # one failed pass must not end the loop
+            log.warning(f"Discord Notifier: retention pass failed ({exc!s:.160})")
+            return 0
 
     async def tracked_messages(self) -> int | None:
         """Number of tracked Discord messages (``None`` without a database)."""
