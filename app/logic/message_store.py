@@ -5,6 +5,13 @@ of a notification handled by *any* core instance (or after a restart) PATCHes
 the message an earlier send created instead of posting a duplicate. A small
 per-process cache sits in front to spare the DB on rapid live updates.
 
+First sends are serialized through the same row (:meth:`MessageStore.claim`):
+before an instance POSTs it inserts a *pending* placeholder
+(``discord_message_id = "pending:<nonce>"``). The unique key lets exactly one
+instance win; the others see the claim, wait for the real id and edit instead of
+posting a second message. A claim whose owner died is taken over after
+``CLAIM_TTL`` seconds, reusing its nonce so Discord can de-duplicate the POST.
+
 All methods are blocking (SQLAlchemy) — the adapter calls them from its
 ``asyncio.to_thread`` send worker; async callers must offload them too.
 Without a database (older core, DB down, tables not bootstrapped yet) the store
@@ -14,10 +21,12 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from core.api import get_logger
@@ -34,6 +43,37 @@ _CACHE_TTL = 60.0
 _CACHE_MAX = 512
 # The leader prunes at most this often (per instance, piggy-backed on writes).
 _PRUNE_INTERVAL = 3600.0
+
+# Placeholder value of ``discord_message_id`` while an instance is creating the
+# message. The column is 32 chars wide and Discord accepts a nonce of up to 25:
+# 8 (prefix) + 24 (nonce) fits both.
+PENDING_PREFIX = "pending:"
+_NONCE_LEN = 24
+# A pending claim is honoured this long. It must outlive one complete send
+# (the adapter's send deadline is ~20 s); after that the owner is presumed dead
+# and the next sender takes the claim over.
+CLAIM_TTL = 60.0
+
+CLAIMED = "claimed"    # caller owns the slot → POST, then put() / release() / abandon()
+EXISTING = "existing"  # a message exists → PATCH ``message_id``
+BUSY = "busy"          # another sender is creating it right now → retry later
+
+
+@dataclass(frozen=True)
+class Claim:
+    state: str
+    message_id: str | None = None
+    # Sent to Discord as the message nonce (with ``enforce_nonce``): a repeated
+    # POST for the same claim returns the first message instead of a new one.
+    nonce: str | None = None
+
+
+def _new_nonce() -> str:
+    return uuid.uuid4().hex[:_NONCE_LEN]
+
+
+def is_pending(message_id: str | None) -> bool:
+    return bool(message_id) and str(message_id).startswith(PENDING_PREFIX)
 
 
 def _utcnow() -> datetime:
@@ -91,7 +131,8 @@ class MessageStore:
         try:
             with get_session() as s:
                 row = s.get(DiscordMessage, {"notification_id": notification_id, "provider_id": provider_id})
-                if row is None or row.channel_id != channel_id:
+                # A pending placeholder is not a message id — see claim().
+                if row is None or row.channel_id != channel_id or is_pending(row.discord_message_id):
                     return None
                 msg_id = row.discord_message_id
         except Exception as exc:
@@ -135,8 +176,118 @@ class MessageStore:
             return
         self.maybe_prune()
 
-    def forget(self, provider_id: str, notification_id: str) -> None:
-        """Drop a mapping whose Discord message no longer accepts edits."""
+    def claim(self, provider_id: str, notification_id: str, channel_id: str | None) -> Claim:
+        """Reserve the right to create the message for this notification.
+
+        Claim-before-send: the placeholder row is inserted *before* the POST, so
+        two senders (two instances, or a gateway retry racing a worker that is
+        still sending) cannot both create a message — the unique key decides.
+
+        Without a database the store cannot coordinate with peers and behaves
+        like the pre-1.2 per-instance map (``CLAIMED`` unless cached).
+        """
+        key = (provider_id, notification_id)
+        cached = self._cache_get(key, channel_id)
+        if cached:
+            return Claim(EXISTING, message_id=cached)
+        if not self.is_ready:
+            return Claim(CLAIMED, nonce=_new_nonce())
+
+        def _tx() -> Claim:
+            now = _utcnow()
+            with get_session() as s:
+                row = s.get(DiscordMessage, {"notification_id": notification_id, "provider_id": provider_id})
+                if row is None:
+                    nonce = _new_nonce()
+                    s.add(DiscordMessage(
+                        notification_id=notification_id, provider_id=provider_id,
+                        channel_id=channel_id, discord_message_id=PENDING_PREFIX + nonce,
+                        created_at=now, updated_at=now,
+                    ))
+                    s.commit()  # IntegrityError → a peer claimed first (handled below)
+                    return Claim(CLAIMED, nonce=nonce)
+
+                current, seen_at = row.discord_message_id, row.updated_at
+                same_channel = row.channel_id == channel_id
+                pending = is_pending(current)
+                if same_channel and not pending:
+                    return Claim(EXISTING, message_id=current)
+                if same_channel and pending and (now - seen_at).total_seconds() < CLAIM_TTL:
+                    return Claim(BUSY)
+                # Take over: an expired claim (owner crashed or never learned the
+                # outcome — keep its nonce so Discord de-duplicates a POST that
+                # did arrive) or a message that lives in a channel no longer used.
+                nonce = current[len(PENDING_PREFIX):] if (pending and same_channel) else _new_nonce()
+                taken = s.execute(
+                    update(DiscordMessage)
+                    .where(
+                        DiscordMessage.notification_id == notification_id,
+                        DiscordMessage.provider_id == provider_id,
+                        # Conditional on what we read: only one of several
+                        # concurrent takers changes the row.
+                        DiscordMessage.discord_message_id == current,
+                        DiscordMessage.updated_at == seen_at,
+                    )
+                    .values(channel_id=channel_id, discord_message_id=PENDING_PREFIX + nonce, updated_at=now)
+                )
+                s.commit()
+                return Claim(CLAIMED, nonce=nonce) if taken.rowcount == 1 else Claim(BUSY)
+
+        try:
+            try:
+                return retry_write(_tx)
+            except IntegrityError:
+                # Lost the insert race — the second pass reads the winner's row.
+                return retry_write(_tx)
+        except Exception as exc:
+            # A notification is worth more than de-duplication: with the DB
+            # unusable (often exactly what the alert is about) post anyway.
+            log.warning(f"Discord store: claim failed ({exc!s:.160}) — sending without coordination")
+            return Claim(CLAIMED, nonce=_new_nonce())
+
+    def release(self, provider_id: str, notification_id: str, nonce: str | None) -> None:
+        """Give a claim back after a POST that definitely created nothing."""
+        self._settle_claim(provider_id, notification_id, nonce, expire=False)
+
+    def abandon(self, provider_id: str, notification_id: str, nonce: str | None) -> None:
+        """Expire a claim whose POST has an unknown outcome (timeout, reset).
+
+        The row stays, already stale: the next sender takes it over at once and
+        repeats the POST with the *same* nonce, so a message Discord did create
+        is returned instead of duplicated.
+        """
+        self._settle_claim(provider_id, notification_id, nonce, expire=True)
+
+    def _settle_claim(self, provider_id: str, notification_id: str, nonce: str | None, *, expire: bool) -> None:
+        if not nonce or not self.is_ready:
+            return
+        mine = (
+            DiscordMessage.notification_id == notification_id,
+            DiscordMessage.provider_id == provider_id,
+            # Only our own placeholder — never a peer's claim or a real id.
+            DiscordMessage.discord_message_id == PENDING_PREFIX + nonce,
+        )
+
+        def _tx() -> None:
+            with get_session() as s:
+                if expire:
+                    stale = _utcnow() - timedelta(seconds=CLAIM_TTL + 1)
+                    s.execute(update(DiscordMessage).where(*mine).values(updated_at=stale))
+                else:
+                    s.execute(delete(DiscordMessage).where(*mine))
+                s.commit()
+
+        try:
+            retry_write(_tx)
+        except Exception as exc:  # the claim then simply expires after CLAIM_TTL
+            log.debug(f"Discord store: could not settle claim ({exc!s:.160})")
+
+    def forget(self, provider_id: str, notification_id: str, message_id: str | None = None) -> None:
+        """Drop a mapping whose Discord message no longer exists.
+
+        With *message_id* the row is only removed while it still points at that
+        message, so a mapping (or claim) a peer wrote in the meantime survives.
+        """
         key = (provider_id, notification_id)
         with self._lock:
             self._cache.pop(key, None)
@@ -145,10 +296,13 @@ class MessageStore:
 
         def _delete() -> None:
             with get_session() as s:
-                s.execute(delete(DiscordMessage).where(
+                stmt = delete(DiscordMessage).where(
                     DiscordMessage.notification_id == notification_id,
                     DiscordMessage.provider_id == provider_id,
-                ))
+                )
+                if message_id is not None:
+                    stmt = stmt.where(DiscordMessage.discord_message_id == message_id)
+                s.execute(stmt)
                 s.commit()
 
         try:

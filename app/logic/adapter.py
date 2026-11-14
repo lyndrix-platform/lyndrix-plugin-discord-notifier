@@ -14,10 +14,18 @@ so the MessagingGateway can look up and resolve the pending action.
 
 Rate limiting
 -------------
-Discord webhooks are rate-limited to ~5 requests / 5 seconds per URL.  The
-adapter inspects the ``Retry-After`` response header on HTTP 429 and sleeps
-inside the background thread before retrying once.  Further back-off is
-handled by the gateway's ``_AdapterRetryWorker``.
+Discord webhooks are rate-limited to ~5 requests / 5 seconds per URL.  On HTTP
+429 the adapter honours ``Retry-After`` and retries once inside the background
+thread — but only if the wait still fits into the send deadline (the gateway's
+``send_timeout`` minus a margin).  Otherwise it returns a retryable failure and
+the gateway's ``_AdapterRetryWorker`` does the back-off, so exactly one party
+retries.
+
+Edits and first sends
+---------------------
+A failed edit (PATCH) only leads to a new message when Discord says the message
+is gone (HTTP 404).  A first send claims the ``discord_messages`` row before the
+POST (see ``message_store.py``), so concurrent senders produce one message.
 
 The 429 back-off is per core instance: N instances sharing one bot token / webhook
 each see (and wait out) their own rate-limit responses — Discord's limit is not
@@ -43,7 +51,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import ClassVar
 from uuid import UUID
@@ -60,7 +70,7 @@ from core.api import (
     ProviderConfigField,
 )
 
-from .message_store import MessageStore
+from .message_store import BUSY, CLAIMED, MessageStore
 
 log = logging.getLogger("Plugin:DiscordAdapter")
 
@@ -92,10 +102,90 @@ _EMBED_FIELD_VALUE_MAX = 1024
 _EMBED_FIELDS_MAX      = 25
 _BUTTON_LABEL_MAX      = 80
 _HTTP_TIMEOUT          = 15   # seconds per request inside asyncio.to_thread
+_CONNECT_TIMEOUT       = 5.0
+
+# The worker thread must be done before the gateway's wait_for(send_timeout)
+# fires, otherwise the gateway queues a retry while the thread is still sending.
+_DEADLINE_MARGIN       = 2.0  # seconds kept free before send_timeout
+_MIN_REQUEST_BUDGET    = 2.0  # do not start a request with less time left
+_RETRY_AFTER_DEFAULT   = 5.0  # 429 without a usable Retry-After
+# While a peer instance is creating the message: poll its claim this often,
+# for at most this long, then edit (or give the retry to the gateway).
+_CLAIM_POLL            = 0.5
+_CLAIM_WAIT_MAX        = 5.0
+
+_EDIT_OK, _EDIT_GONE, _EDIT_RETRY = "ok", "gone", "retry"
 
 # get_config_fields() is called synchronously by the core from async routes, so
 # it serves Vault values cached by the off-thread config reads for this long.
 _VAULT_CACHE_TTL = 120.0
+
+
+class _HttpResult:
+    """Outcome of one Discord call.
+
+    ``response`` is ``None`` when no answer was received. ``uncertain`` tells
+    the two cases apart: ``True`` — the request was sent and may have been
+    processed (timeout, connection reset); ``False`` — it was never sent.
+    """
+
+    __slots__ = ("response", "uncertain")
+
+    def __init__(self, response, *, uncertain: bool) -> None:
+        self.response = response
+        self.uncertain = uncertain
+
+
+def _timeouts(remaining: float) -> tuple[float, float]:
+    """``(connect, read)`` for requests so that both together fit *remaining*."""
+    connect = min(_CONNECT_TIMEOUT, remaining / 3)
+    read = min(float(_HTTP_TIMEOUT), remaining - connect)
+    return connect, read
+
+
+def _retry_after(resp) -> float:
+    """Seconds Discord asks us to wait: JSON ``retry_after``, else the header."""
+    candidates = []
+    try:
+        candidates.append(resp.json().get("retry_after"))
+    except Exception:
+        pass
+    candidates.append((getattr(resp, "headers", None) or {}).get("Retry-After"))
+    for raw in candidates:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            return value
+    return _RETRY_AFTER_DEFAULT
+
+
+class _KeyedLocks:
+    """One lock per key, created on demand and dropped when nobody uses it."""
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[object, tuple[threading.Lock, int]] = {}
+
+    @contextmanager
+    def hold(self, key, timeout: float):
+        """Yield ``True`` once *key* is held, ``False`` if *timeout* ran out."""
+        with self._guard:
+            lock, users = self._locks.get(key, (threading.Lock(), 0))
+            self._locks[key] = (lock, users + 1)
+        acquired = lock.acquire(timeout=max(timeout, 0.0))
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                lock.release()
+            with self._guard:
+                lock, users = self._locks[key]
+                if users <= 1:
+                    del self._locks[key]
+                else:
+                    self._locks[key] = (lock, users - 1)
 
 
 def _truncate(s: str, limit: int) -> str:
@@ -157,6 +247,8 @@ class DiscordGatewayAdapter(GatewayAdapter):
         self._store = store if store is not None else MessageStore(ctx)
         # Vault key → (value, monotonic read time); see _VAULT_CACHE_TTL.
         self._vault_cache: dict[str, tuple[str | None, float]] = {}
+        # (provider_id, notification_id) → lock: serializes sends per notification.
+        self._inflight = _KeyedLocks()
 
     # ------------------------------------------------------------------
     # Config helpers
@@ -274,17 +366,25 @@ class DiscordGatewayAdapter(GatewayAdapter):
     # ------------------------------------------------------------------
 
     async def send(self, message: OutboundMessage) -> str | None:
+        # The gateway waits ``send_timeout`` for this coroutine and then queues
+        # a retry — but it cannot stop the worker thread. The deadline is fixed
+        # here, on the loop, so time spent queueing for a thread counts too: the
+        # worker gives up (returns None) before the gateway does, and exactly
+        # one party retries (audit DN-02).
+        deadline = time.monotonic() + max(self.send_timeout - _DEADLINE_MARGIN, _MIN_REQUEST_BUDGET)
         # All work below (Vault config reads + the HTTP call) is synchronous, so
         # run the whole dispatch in a worker thread to keep the loop unblocked.
-        return await asyncio.to_thread(self._send_sync, message)
+        return await asyncio.to_thread(self._send_sync, message, deadline)
 
-    def _send_sync(self, message: OutboundMessage) -> str | None:
+    def _send_sync(self, message: OutboundMessage, deadline: float | None = None) -> str | None:
+        if deadline is None:
+            deadline = time.monotonic() + max(self.send_timeout - _DEADLINE_MARGIN, _MIN_REQUEST_BUDGET)
         # Prefer the Bot API (supports editing). Fall back to webhook when no
         # bot_token/channel_id is configured.
         bot_token  = self._get_config("bot_token")
         channel_id = self._get_config("channel_id")
         if bot_token and channel_id:
-            return self._send_via_bot_api(message, bot_token, channel_id)
+            return self._send_via_bot_api(message, bot_token, channel_id, deadline)
 
         webhook_url = self._get_config("webhook_url")
         if not webhook_url:
@@ -296,37 +396,72 @@ class DiscordGatewayAdapter(GatewayAdapter):
 
         bot_name = self._get_config("bot_name") or "Lyndrix"
         payload  = self._build_payload(message, bot_name)
-        instance = self._instance_id
 
-        try:
-            resp = requests.post(str(webhook_url), json=payload, timeout=_HTTP_TIMEOUT)
+        result = self._request("POST", str(webhook_url), payload, None, deadline)
+        resp = result.response
+        if resp is None:
+            return None
+        if resp.status_code in (200, 204):
+            log.debug("Discord adapter [%s]: delivered (HTTP %s).", self._instance_id, resp.status_code)
+            return str(resp.status_code)
+        log.warning(
+            "Discord adapter [%s]: webhook returned %s — %s",
+            self._instance_id, resp.status_code, resp.text[:200],
+        )
+        return None
 
-            # Rate-limited: wait for the Retry-After window, then retry once.
-            if resp.status_code == 429:
-                retry_after = 5.0
-                try:
-                    retry_after = float(resp.json().get("retry_after", 5.0))
-                except Exception:
-                    pass
+    # ------------------------------------------------------------------
+    # HTTP with a deadline
+    # ------------------------------------------------------------------
+
+    def _request(self, method: str, url: str, payload: dict, headers: dict | None, deadline: float) -> "_HttpResult":
+        """One Discord call, at most one rate-limit wait, never past *deadline*.
+
+        On HTTP 429 the ``Retry-After`` window is honoured only if the wait plus
+        a second attempt still fit into the deadline. Otherwise the 429 response
+        is returned as it is: the caller reports a retryable failure and the
+        gateway's retry worker (which backs off on its own) tries again —
+        sleeping here as well would let both of them send.
+        """
+        call = requests.patch if method == "PATCH" else requests.post
+        attempts = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining < _MIN_REQUEST_BUDGET:
                 log.warning(
-                    "Discord adapter [%s]: rate limited (429) — sleeping %.1fs before retry.",
-                    instance, retry_after,
+                    "Discord [%s]: no time left for %s before the send deadline — leaving it to the gateway retry.",
+                    self._instance_id, method,
                 )
-                time.sleep(retry_after)
-                resp = requests.post(str(webhook_url), json=payload, timeout=_HTTP_TIMEOUT)
+                return _HttpResult(None, uncertain=False)
+            kwargs: dict = {"json": payload, "timeout": _timeouts(remaining)}
+            if headers:
+                kwargs["headers"] = headers
+            attempts += 1
+            try:
+                resp = call(url, **kwargs)
+            except Exception as exc:
+                # Only the exception type: requests puts the request URL into the
+                # message, and a webhook URL carries its token.
+                log.error("Discord [%s]: %s failed (%s).", self._instance_id, method, type(exc).__name__)
+                # The request may or may not have reached Discord.
+                return _HttpResult(None, uncertain=True)
 
-            if resp.status_code in (200, 204):
-                log.debug("Discord adapter [%s]: delivered (HTTP %s).", instance, resp.status_code)
-                return str(resp.status_code)
+            if resp.status_code != 429 or attempts > 1:
+                return _HttpResult(resp, uncertain=False)
 
+            wait = _retry_after(resp)
+            if time.monotonic() + wait + _MIN_REQUEST_BUDGET > deadline:
+                log.warning(
+                    "Discord [%s]: rate limited (429, retry after %.1fs) — does not fit the send deadline, "
+                    "leaving the retry to the gateway.",
+                    self._instance_id, wait,
+                )
+                return _HttpResult(resp, uncertain=False)
             log.warning(
-                "Discord adapter [%s]: webhook returned %s — %s",
-                instance, resp.status_code, resp.text[:200],
+                "Discord [%s]: rate limited (429) — sleeping %.1fs before one retry.",
+                self._instance_id, wait,
             )
-            return None
-        except Exception as exc:
-            log.error("Discord adapter [%s]: send failed: %s", instance, exc)
-            return None
+            time.sleep(wait)
 
     # ------------------------------------------------------------------
     # Bot API delivery (POST/PATCH /channels/{id}/messages)
@@ -337,7 +472,10 @@ class DiscordGatewayAdapter(GatewayAdapter):
         message: OutboundMessage,
         bot_token: str,
         channel_id: str,
+        deadline: float | None = None,
     ) -> str | None:
+        if deadline is None:
+            deadline = time.monotonic() + max(self.send_timeout - _DEADLINE_MARGIN, _MIN_REQUEST_BUDGET)
         payload         = self._build_api_payload(message)
         notification_id = (message.metadata or {}).get("notification_id")
         headers = {
@@ -346,40 +484,113 @@ class DiscordGatewayAdapter(GatewayAdapter):
         }
         base_url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
 
-        # Try to edit an existing message first (the id may have been stored by
-        # another core instance — the store is DB-backed).
-        if notification_id:
-            existing_id = self._store.get(self.provider_id, str(notification_id), str(channel_id))
-            if existing_id:
-                edit_url = f"{base_url}/{existing_id}"
-                try:
-                    resp = requests.patch(
-                        edit_url, json=payload, headers=headers, timeout=_HTTP_TIMEOUT,
-                    )
-                except Exception as exc:
-                    log.error(
-                        "Discord [%s]: edit request failed: %s",
-                        self._instance_id, exc,
+        if not notification_id:
+            # Nothing to edit later and nothing to de-duplicate against.
+            return self._create(base_url, payload, headers, deadline)
+
+        nid = str(notification_id)
+        # One send per notification at a time in this process: an update that
+        # arrives (or a gateway retry that fires) while an earlier send is still
+        # in flight waits for it and then edits, instead of racing it.
+        with self._inflight.hold((self.provider_id, nid), deadline - time.monotonic() - _MIN_REQUEST_BUDGET) as held:
+            if not held:
+                log.warning(
+                    "Discord [%s]: an earlier send for notification %s is still running — retry later.",
+                    self._instance_id, nid,
+                )
+                return None
+            return self._upsert_message(nid, str(channel_id), base_url, payload, headers, deadline)
+
+    def _upsert_message(
+        self, nid: str, channel_id: str, base_url: str, payload: dict, headers: dict, deadline: float,
+    ) -> str | None:
+        """Edit the notification's message, or create it if there is none (yet/any more)."""
+        # Second pass only after an edit found the message deleted on Discord.
+        for _ in range(2):
+            existing_id = self._store.get(self.provider_id, nid, channel_id)
+            claim = None
+            if existing_id is None:
+                claim = self._claim(nid, channel_id, deadline)
+                if claim.state == BUSY:
+                    log.warning(
+                        "Discord [%s]: another instance is creating the message for notification %s — retry later.",
+                        self._instance_id, nid,
                     )
                     return None
-                if resp.status_code == 200:
-                    log.debug(
-                        "Discord [%s]: edited message %s.",
-                        self._instance_id, existing_id,
-                    )
-                    return existing_id
-                log.warning(
-                    "Discord [%s]: edit failed (HTTP %s) — creating new message instead.",
-                    self._instance_id, resp.status_code,
-                )
-                # Drop the stale id so no instance keeps PATCHing it.
-                self._store.forget(self.provider_id, str(notification_id))
+                if claim.state == CLAIMED:
+                    return self._create(base_url, payload, headers, deadline, nid=nid, channel_id=channel_id, claim=claim)
+                existing_id = claim.message_id
 
-        # POST a new message (and remember its id if we have a notification_id).
-        resp = self._post_with_rate_limit(base_url, payload, headers)
+            outcome = self._edit(f"{base_url}/{existing_id}", payload, headers, deadline)
+            if outcome == _EDIT_OK:
+                log.debug("Discord [%s]: edited message %s.", self._instance_id, existing_id)
+                return existing_id
+            if outcome == _EDIT_RETRY:
+                return None
+            # _EDIT_GONE: the message was deleted on Discord. Drop the mapping
+            # (only if it still points there) and create a fresh message.
+            log.warning(
+                "Discord [%s]: message %s no longer exists — creating a new one.",
+                self._instance_id, existing_id,
+            )
+            self._store.forget(self.provider_id, nid, existing_id)
+        return None
+
+    def _claim(self, nid: str, channel_id: str, deadline: float):
+        """Claim the first send; wait briefly while a peer is creating the message."""
+        waited = 0.0
+        while True:
+            claim = self._store.claim(self.provider_id, nid, channel_id)
+            if claim.state != BUSY:
+                return claim
+            # The peer normally finishes within a second or two; then we edit.
+            budget_left = deadline - time.monotonic() - _MIN_REQUEST_BUDGET
+            if waited >= _CLAIM_WAIT_MAX or budget_left < _CLAIM_POLL:
+                return claim
+            time.sleep(_CLAIM_POLL)
+            waited += _CLAIM_POLL
+
+    def _edit(self, edit_url: str, payload: dict, headers: dict, deadline: float) -> str:
+        """PATCH an existing message → ``_EDIT_OK`` / ``_EDIT_GONE`` / ``_EDIT_RETRY``.
+
+        Only a definitive "this message does not exist" (HTTP 404, Discord code
+        10008) may lead to a new message. A rate limit, a 5xx or a timeout says
+        nothing about the message: reposting then would leave the old message
+        frozen and add a new one per update — under a rate limit that amplifies
+        the very condition that caused it (audit DN-01).
+        """
+        result = self._request("PATCH", edit_url, payload, headers, deadline)
+        resp = result.response
         if resp is None:
-            return None
+            return _EDIT_RETRY
         if resp.status_code == 200:
+            return _EDIT_OK
+        if resp.status_code == 404:
+            return _EDIT_GONE
+        if resp.status_code in (401, 403):
+            # Possibly a rotated token still in the config cache: re-read next time.
+            self._vault_cache.clear()
+        log.warning(
+            "Discord [%s]: edit failed (HTTP %s) — keeping the message, the gateway retries the edit.",
+            self._instance_id, resp.status_code,
+        )
+        return _EDIT_RETRY
+
+    def _create(
+        self, base_url: str, payload: dict, headers: dict, deadline: float,
+        *, nid: str | None = None, channel_id: str | None = None, claim=None,
+    ) -> str | None:
+        """POST a new message; settle the claim according to the outcome."""
+        nonce = claim.nonce if claim is not None else None
+        if nonce:
+            # Discord returns the already created message for a repeated nonce
+            # instead of creating another one (a few minutes' window) — covers a
+            # POST that arrived although we only saw a timeout.
+            payload = {**payload, "nonce": nonce, "enforce_nonce": True}
+
+        result = self._request("POST", base_url, payload, headers, deadline)
+        resp = result.response
+        if resp is not None and resp.status_code == 200:
             try:
                 discord_msg_id = str(resp.json()["id"])
             except Exception as exc:
@@ -387,43 +598,28 @@ class DiscordGatewayAdapter(GatewayAdapter):
                     "Discord [%s]: created message but response had no id: %s",
                     self._instance_id, exc,
                 )
+                if nid:
+                    self._store.abandon(self.provider_id, nid, nonce)
                 return None
-            if notification_id:
-                self._store.put(self.provider_id, str(notification_id), str(channel_id), discord_msg_id)
-            log.debug(
-                "Discord [%s]: created message %s.",
-                self._instance_id, discord_msg_id,
-            )
+            if nid:
+                self._store.put(self.provider_id, nid, channel_id, discord_msg_id)
+            log.debug("Discord [%s]: created message %s.", self._instance_id, discord_msg_id)
             return discord_msg_id
-        log.warning(
-            "Discord [%s]: bot API create returned %s — %s",
-            self._instance_id, resp.status_code, resp.text[:200],
-        )
-        return None
 
-    def _post_with_rate_limit(self, url: str, payload: dict, headers: dict):
-        try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=_HTTP_TIMEOUT)
-        except Exception as exc:
-            log.error("Discord [%s]: post failed: %s", self._instance_id, exc)
-            return None
-        if resp.status_code == 429:
-            retry_after = 5.0
-            try:
-                retry_after = float(resp.json().get("retry_after", 5.0))
-            except Exception:
-                pass
+        if resp is not None:
+            if resp.status_code in (401, 403):
+                self._vault_cache.clear()
             log.warning(
-                "Discord [%s]: rate limited (429) — sleeping %.1fs before retry.",
-                self._instance_id, retry_after,
+                "Discord [%s]: bot API create returned %s — %s",
+                self._instance_id, resp.status_code, resp.text[:200],
             )
-            time.sleep(retry_after)
-            try:
-                resp = requests.post(url, json=payload, headers=headers, timeout=_HTTP_TIMEOUT)
-            except Exception as exc:
-                log.error("Discord [%s]: retry post failed: %s", self._instance_id, exc)
-                return None
-        return resp
+        if nid:
+            if result.uncertain:
+                self._store.abandon(self.provider_id, nid, nonce)
+            else:
+                # Discord answered (or was never asked): nothing was created.
+                self._store.release(self.provider_id, nid, nonce)
+        return None
 
     # ------------------------------------------------------------------
     # Payload builders
