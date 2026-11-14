@@ -717,6 +717,52 @@ class DiscordGatewayAdapter(GatewayAdapter):
     # Inbound (Discord Component Interactions, type=3)
     # ------------------------------------------------------------------
 
+    def lyndrix_user_for(self, discord_user_id: str | None) -> str | None:
+        """Lyndrix username linked to a Discord user id — ``None`` = not linked.
+
+        A button click is an action request by *somebody in the Discord
+        channel*; it may only be acted on for a known Lyndrix user who is
+        allowed to perform that action. No Discord ↔ Lyndrix account link exists
+        yet, so nobody is linked and every component interaction is refused
+        (audit DN-03) — fail closed rather than trust channel membership.
+        """
+        # TODO(agent): needs a core/gateway feature — a provider-user → Lyndrix-user
+        # mapping (per-user "linked accounts" or an admin-managed allowlist) plus a
+        # permission check for the pending action in MessagingGateway.handle_incoming
+        # before the resume topic is emitted. Resolve the user here once it exists.
+        del discord_user_id
+        return None
+
+    @staticmethod
+    def interaction_user_id(raw: dict) -> str | None:
+        """Discord user id of the member/user who triggered an interaction."""
+        member = raw.get("member") or {}
+        user = member.get("user") or raw.get("user") or {}
+        user_id = user.get("id")
+        return str(user_id) if user_id else None
+
+    @staticmethod
+    def _public_interaction(raw: dict) -> dict:
+        """The part of an interaction that may travel on the event bus.
+
+        Allowlist, not denylist: the raw payload carries the interaction
+        ``token`` (lets its holder post follow-ups and edit the original message
+        for 15 minutes) and the member object (roles, permissions, nick) — the
+        bus delivers payloads to every subscriber and to peer instances.
+        """
+        data = raw.get("data") or {}
+        message = raw.get("message") or {}
+        return {
+            "id": raw.get("id"),
+            "type": raw.get("type"),
+            "application_id": raw.get("application_id"),
+            "guild_id": raw.get("guild_id"),
+            "channel_id": raw.get("channel_id"),
+            "message_id": message.get("id"),
+            "custom_id": data.get("custom_id"),
+            "component_type": data.get("component_type"),
+        }
+
     async def handle_incoming(self, raw: dict) -> InboundMessage | None:
         interaction_type = raw.get("type")
 
@@ -731,9 +777,17 @@ class DiscordGatewayAdapter(GatewayAdapter):
 
         data      = raw.get("data") or {}
         custom_id = data.get("custom_id") or ""
-        member    = raw.get("member") or {}
-        user      = member.get("user") or raw.get("user") or {}
-        user_id   = user.get("id")
+        user_id   = self.interaction_user_id(raw)
+
+        # Authorization gate (also enforced by the route, which answers the
+        # user): without a linked Lyndrix user nothing reaches the gateway.
+        lyndrix_user = self.lyndrix_user_for(user_id)
+        if not lyndrix_user:
+            log.warning(
+                "Discord adapter: component interaction by unlinked Discord user %s refused.",
+                user_id or "<unknown>",
+            )
+            return None
 
         # custom_id format: "{action_id}:{correlation_id}"
         action_id, _, corr_str = custom_id.partition(":")
@@ -750,5 +804,11 @@ class DiscordGatewayAdapter(GatewayAdapter):
             correlation_id=correlation_id,
             action_id=action_id or None,
             user_id=user_id,
-            metadata={"raw_interaction": raw},
+            # Consumers of the resume topic must still check that ``lyndrix_user``
+            # may perform ``action_id``. ``raw_interaction`` keeps its name for
+            # compatibility but only carries the allowlisted, secret-free fields.
+            metadata={
+                "lyndrix_user": lyndrix_user,
+                "raw_interaction": self._public_interaction(raw),
+            },
         )

@@ -65,8 +65,10 @@ def test_save_config_rejects_invalid_webhook_url():
     )
 
 
-def test_handle_incoming_routes_component_with_correlation():
+def test_handle_incoming_routes_component_with_correlation(monkeypatch):
     adapter = DiscordGatewayAdapter(StubCtx(), instance_id="ops")
+    # A linked account (no such mapping ships yet — see test_interactions.py).
+    monkeypatch.setattr(adapter, "lyndrix_user_for", lambda uid: "alice" if uid == "42" else None)
     corr = "123e4567-e89b-12d3-a456-426614174000"
     raw = {
         "type": 3,

@@ -38,6 +38,14 @@ _TYPE_COMPONENT  = 3
 # Reject interactions whose signed timestamp is older than this (replay window).
 _MAX_TIMESTAMP_SKEW = 300  # seconds
 
+# Interaction callback: CHANNEL_MESSAGE_WITH_SOURCE, shown only to the clicker.
+_CALLBACK_MESSAGE = 4
+_FLAG_EPHEMERAL   = 64
+_NOT_LINKED_TEXT  = (
+    "Your Discord account is not linked to a Lyndrix user that is allowed to "
+    "perform this action. Nothing was changed — please use the Lyndrix web UI."
+)
+
 
 def build_interaction_router(adapter: "DiscordGatewayAdapter") -> APIRouter:
     """Return a FastAPI router pre-bound to *adapter*."""
@@ -88,6 +96,22 @@ def build_interaction_router(adapter: "DiscordGatewayAdapter") -> APIRouter:
         # Discord PING — must reply with type=1 immediately
         if interaction_type == _TYPE_PING:
             return JSONResponse({"type": 1})
+
+        # A button click triggers an action in Lyndrix. The signature only
+        # proves the request comes from Discord, not that the clicking channel
+        # member may do that — refuse unless the Discord user maps to a Lyndrix
+        # user, tell them so (ephemeral), and forward nothing (audit DN-03).
+        if interaction_type == _TYPE_COMPONENT:
+            discord_user = adapter.interaction_user_id(payload)
+            if not adapter.lyndrix_user_for(discord_user):
+                log.warning(
+                    "Discord router: component interaction by unlinked Discord user %s refused.",
+                    discord_user or "<unknown>",
+                )
+                return JSONResponse({
+                    "type": _CALLBACK_MESSAGE,
+                    "data": {"content": _NOT_LINKED_TEXT, "flags": _FLAG_EPHEMERAL},
+                })
 
         # Route component interactions through the gateway using this adapter's
         # actual provider_id (e.g. "discord" or "discord:ops").
