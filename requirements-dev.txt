@@ -4,4 +4,4 @@ pytest-cov
 mypy
 ruff
 black
-requests>=2.31
+requests>=2.32.4

@@ -86,3 +86,13 @@ def test_handle_incoming_routes_component_with_correlation(monkeypatch):
 def test_handle_incoming_ignores_ping():
     adapter = DiscordGatewayAdapter(StubCtx())
     assert asyncio.run(adapter.handle_incoming({"type": 1})) is None
+
+
+def test_requests_floor_excludes_the_netrc_leak():
+    """DN-04..07 dependency note: requests < 2.32.4 has CVE-2024-47081."""
+    from pathlib import Path
+
+    lines = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text().splitlines()
+    spec = next(line for line in lines if line.lower().startswith("requests"))
+    floor = tuple(int(part) for part in spec.split(">=")[1].split("."))
+    assert floor >= (2, 32, 4)
