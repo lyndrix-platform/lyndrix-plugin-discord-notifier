@@ -27,7 +27,7 @@ from core.api import ModuleManifest, PluginHealthStatus, db_instance
 
 from .app.api.router import build_interaction_router
 from .app.logic.adapter import DiscordGatewayAdapter
-from .app.logic.service import DiscordNotifierService
+from .app.logic.service import PUBLIC_KEY_SETTING, DiscordNotifierService
 
 manifest = ModuleManifest(
     id="lyndrix.plugin.discord",
@@ -44,11 +44,19 @@ manifest = ModuleManifest(
     auto_enable_on_install=False,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-discord-notifier",
     permissions={
-        "subscribe": ["system:boot_complete", "db:connected"],
+        # plugin:settings_changed (bridged to every instance): drop the cached
+        # interactions public key when the operator saves the settings.
+        "subscribe": ["system:boot_complete", "db:connected", "plugin:settings_changed"],
         "emit": [],
     },
     # Core schema-driven settings dialog (stored in Vault, read via ctx.get_setting).
     settings_schema=[
+        {"key": PUBLIC_KEY_SETTING, "label": "Interactions public key", "kind": "str",
+         "category": "Interactions", "default": "",
+         "description": "Ed25519 public key of the Discord application (Developer Portal → General "
+                        "Information → Public Key, 64 hex characters). Required for the interactions "
+                        "endpoint; without it every interaction is refused (HTTP 503). Not a secret. "
+                        "Falls back to the Vault secret 'discord_public_key' when empty."},
         {"key": "message_retention_days", "label": "Message map retention (days)", "kind": "int",
          "category": "Storage", "default": "30",
          "description": "Notification → Discord message mappings not updated for this long are pruned "
@@ -132,7 +140,7 @@ def setup(ctx):
         # verification (app/api/router.py:118), which fails closed on any
         # missing/invalid signature, so this is not an open route.
         try:
-            ctx.register_routes(build_interaction_router(_adapters[0]), public=True)
+            ctx.register_routes(build_interaction_router(_adapters[0], _service.public_key), public=True)
         except TypeError:
             # Older core (< 1.1.0) has no public-route parameter. The Interactions
             # webhook only works unauthenticated, so mounting it behind
@@ -160,6 +168,12 @@ def setup(ctx):
     async def _on_db_connected(payload):
         if await service.bootstrap():
             ctx.log.info("Discord Notifier: message store ready.")
+
+    @ctx.subscribe("plugin:settings_changed")
+    async def _on_settings_changed(payload):
+        # {plugin_id, keys, by} — re-read the public key on the next interaction.
+        if isinstance(payload, dict) and payload.get("plugin_id") == manifest.id:
+            service.public_key.invalidate()
 
     @ctx.subscribe("system:boot_complete")
     async def _on_boot(payload):
