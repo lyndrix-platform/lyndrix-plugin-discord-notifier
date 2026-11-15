@@ -32,7 +32,7 @@ from .app.logic.service import PRUNE_LEASE, PUBLIC_KEY_SETTING, DiscordNotifierS
 manifest = ModuleManifest(
     id="lyndrix.plugin.discord",
     name="Discord Notifier",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Two-way Discord integration via the Lyndrix Messaging Gateway. "
         "Supports multiple channel instances via env vars."

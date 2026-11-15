@@ -5,11 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-Proposed version: **1.3.0** (security and reliability audit 2026-11; the manifest version is not bumped yet).
+## [1.3.0] - 2026-11-15
+Security and reliability audit 2026-11.
 Minimum core unchanged; no React bundle.
 
-### Security (audit 2026-11)
+### Security
 - A button click (component interaction) is refused with an ephemeral "not linked" reply unless the Discord user maps to
   a Lyndrix user — no mapping exists yet, so every click is refused (fail closed). `metadata.raw_interaction` is an
   allow-list of ids; the interaction token and the member object never reach the bus (DN-03).
@@ -20,7 +20,7 @@ Minimum core unchanged; no React bundle.
   cached config so a rotated token is re-read.
 - `requests >= 2.32.4` (CVE-2024-47081, hardening).
 
-### Fixed (audit 2026-11)
+### Fixed
 - One notification can no longer become several Discord messages: a failed edit never reposts (only "message gone"
   does), a 429 wait is bounded by the send deadline so exactly one party retries, and the first send claims the
   `discord_messages` row before posting, so two instances cannot both post (DN-01, DN-02, DN-07).
@@ -29,12 +29,15 @@ Minimum core unchanged; no React bundle.
 - Retention of `discord_messages` runs hourly under the lease `discord:prune` on exactly one instance; it no longer
   depends on the core leader sending a message itself (DN-06).
 
-### Security
+The following notes were kept under "Unreleased" in earlier trees although the code was already part of the
+1.2.0 tag (canonical layout, fail-closed interactions); they are listed here so they are not lost.
+
+### Security (earlier)
 - Interaction endpoint now fails closed (HTTP 503) when `discord_public_key` is
   not configured, instead of processing unsigned requests.
 - Added replay protection: interactions with a stale signed timestamp are rejected.
 
-### Changed
+### Changed (earlier)
 - Moved to the canonical plugin layout: `app/controller/` → `app/logic/`, router
   into `app/api/`, NiceGUI page into `app/ui/nicegui/`.
 - Imports now go through the stable `core.api` surface (no `core.components.*` /
@@ -46,7 +49,7 @@ Minimum core unchanged; no React bundle.
 - NiceGUI settings page persists through `DiscordGatewayAdapter.save_config()`
   (webhook URLs are validated) instead of writing Vault directly.
 
-### Fixed
+### Fixed (earlier)
 - Settings page no longer exposes a non-functional "enabled" switch; bot name is
   now persisted and its default matches the adapter (`Lyndrix`).
 - Rewrote the broken test suite against the current adapter/service API.
