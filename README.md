@@ -11,8 +11,14 @@ It supports **multiple independent instances** for different Discord channels/se
 
 - **Dual-mode delivery** — Discord bot API and/or incoming webhooks.
 - **Multiple instances** — register several Discord targets (e.g. `ops`, `alerts`) at once.
-- **Gateway adapter** — outbound messages routed via `messaging:outbound`; supports interactive
-  actions/replies through the gateway's correlation mechanism.
+- **Gateway adapter** — outbound messages routed via `messaging:outbound`.
+
+## Planned features
+
+- **Interactive buttons** (acknowledge / take over from Discord) — planned, **switched off** since
+  1.3.0: a click is refused until a Discord user can be linked to a Lyndrix user, the action is
+  permission-checked and every click is audited (audit finding DN-03). Details and prerequisites:
+  [`docs/planned-features.md`](docs/planned-features.md).
 
 ## Configuration
 

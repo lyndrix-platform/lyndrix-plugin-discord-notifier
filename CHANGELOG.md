@@ -20,6 +20,10 @@ Minimum core unchanged; no React bundle.
   cached config so a rotated token is re-read.
 - `requests >= 2.32.4` (CVE-2024-47081, hardening).
 
+### Documentation
+- Interactive buttons are documented as a planned feature with their prerequisites (account linking, permission
+  check per action, audit trail): `docs/planned-features.md`.
+
 ### Fixed
 - One notification can no longer become several Discord messages: a failed edit never reposts (only "message gone"
   does), a 429 wait is bounded by the send deadline so exactly one party retries, and the first send claims the
