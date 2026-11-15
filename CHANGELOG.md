@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+Proposed version: **1.3.0** (security and reliability audit 2026-11; the manifest version is not bumped yet).
+Minimum core unchanged; no React bundle.
+
+### Security (audit 2026-11)
+- A button click (component interaction) is refused with an ephemeral "not linked" reply unless the Discord user maps to
+  a Lyndrix user — no mapping exists yet, so every click is refused (fail closed). `metadata.raw_interaction` is an
+  allow-list of ids; the interaction token and the member object never reach the bus (DN-03).
+- The public `/interactions` route caps the body at 64 KiB (413) before any key lookup and reads the public key at most
+  once per 60 s. New setting `interactions_public_key`; the Vault secret `discord_public_key` remains the fallback, and
+  a value that is not 64 hex characters counts as not configured (503) (DN-04).
+- Request errors are logged by exception type only (a webhook URL contains its token); a 401/403 from Discord drops the
+  cached config so a rotated token is re-read.
+- `requests >= 2.32.4` (CVE-2024-47081, hardening).
+
+### Fixed (audit 2026-11)
+- One notification can no longer become several Discord messages: a failed edit never reposts (only "message gone"
+  does), a 429 wait is bounded by the send deadline so exactly one party retries, and the first send claims the
+  `discord_messages` row before posting, so two instances cannot both post (DN-01, DN-02, DN-07).
+- `health()` and `send()` read the config through the 120 s Vault cache instead of two to four Vault reads per call
+  (DN-05).
+- Retention of `discord_messages` runs hourly under the lease `discord:prune` on exactly one instance; it no longer
+  depends on the core leader sending a message itself (DN-06).
+
 ### Security
 - Interaction endpoint now fails closed (HTTP 503) when `discord_public_key` is
   not configured, instead of processing unsigned requests.
