@@ -15,7 +15,6 @@ Set up in Discord Developer Portal:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -25,6 +24,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from core.api import messaging_gateway
+
+from ..logic.service import PublicKeyCache
 
 if TYPE_CHECKING:
     from ..logic.adapter import DiscordGatewayAdapter
@@ -38,31 +39,61 @@ _TYPE_COMPONENT  = 3
 # Reject interactions whose signed timestamp is older than this (replay window).
 _MAX_TIMESTAMP_SKEW = 300  # seconds
 
+# Discord interactions are a few kB. The endpoint is public, so the body is
+# capped before anything else is done with it.
+_MAX_BODY_BYTES = 64 * 1024
 
-def build_interaction_router(adapter: "DiscordGatewayAdapter") -> APIRouter:
-    """Return a FastAPI router pre-bound to *adapter*."""
+# Interaction callback: CHANNEL_MESSAGE_WITH_SOURCE, shown only to the clicker.
+_CALLBACK_MESSAGE = 4
+_FLAG_EPHEMERAL   = 64
+_NOT_LINKED_TEXT  = (
+    "Your Discord account is not linked to a Lyndrix user that is allowed to "
+    "perform this action. Nothing was changed — please use the Lyndrix web UI."
+)
+
+
+async def _read_body(request: Request) -> bytes:
+    """The request body, refusing (413) anything above ``_MAX_BODY_BYTES``."""
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > _MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Request body too large")
+    chunks, size = [], 0
+    async for chunk in request.stream():  # also bounds chunked uploads
+        size += len(chunk)
+        if size > _MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Request body too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def build_interaction_router(
+    adapter: "DiscordGatewayAdapter", public_key: PublicKeyCache | None = None,
+) -> APIRouter:
+    """Return a FastAPI router pre-bound to *adapter*.
+
+    *public_key* is the shared key cache (the entrypoint passes the service's,
+    which it invalidates on ``plugin:settings_changed``).
+    """
     router = APIRouter()
+    key_cache = public_key if public_key is not None else PublicKeyCache(adapter._ctx)
 
     @router.post("/interactions")
     async def discord_interactions(request: Request) -> Response:
         """Receive and route Discord Component Interactions."""
-        body      = await request.body()
+        body      = await _read_body(request)
         signature = request.headers.get("X-Signature-Ed25519", "")
         timestamp = request.headers.get("X-Signature-Timestamp", "")
 
         # Verify Ed25519 signature ----------------------------------------
-        # Vault reads are synchronous (hvac) — offload to a thread so we never
-        # block the event loop.
-        public_key_hex = await asyncio.to_thread(
-            adapter._ctx.get_secret, "discord_public_key"
-        ) or ""
+        # Served from a short-lived cache: this route is unauthenticated, and a
+        # Vault read per request would let anyone make the core hammer Vault
+        # and occupy worker threads (audit DN-04).
+        public_key_hex = await key_cache.get()
         # Fail closed: without a configured public key we cannot authenticate
         # the request, so refuse to process it rather than trusting it blindly.
-        # TODO(agent): make the public key required config for inbound and mark
-        # the adapter inbound-disabled/unhealthy while it is absent.
         if not public_key_hex:
-            log.warning(
-                "Discord router: 'discord_public_key' not configured — "
+            log.debug(
+                "Discord router: no interactions public key configured — "
                 "refusing interaction (signature verification unavailable)."
             )
             raise HTTPException(
@@ -88,6 +119,22 @@ def build_interaction_router(adapter: "DiscordGatewayAdapter") -> APIRouter:
         # Discord PING — must reply with type=1 immediately
         if interaction_type == _TYPE_PING:
             return JSONResponse({"type": 1})
+
+        # A button click triggers an action in Lyndrix. The signature only
+        # proves the request comes from Discord, not that the clicking channel
+        # member may do that — refuse unless the Discord user maps to a Lyndrix
+        # user, tell them so (ephemeral), and forward nothing (audit DN-03).
+        if interaction_type == _TYPE_COMPONENT:
+            discord_user = adapter.interaction_user_id(payload)
+            if not adapter.lyndrix_user_for(discord_user):
+                log.warning(
+                    "Discord router: component interaction by unlinked Discord user %s refused.",
+                    discord_user or "<unknown>",
+                )
+                return JSONResponse({
+                    "type": _CALLBACK_MESSAGE,
+                    "data": {"content": _NOT_LINKED_TEXT, "flags": _FLAG_EPHEMERAL},
+                })
 
         # Route component interactions through the gateway using this adapter's
         # actual provider_id (e.g. "discord" or "discord:ops").

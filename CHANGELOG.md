@@ -5,13 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-11-15
+Security and reliability audit 2026-11.
+Minimum core unchanged; no React bundle.
+
 ### Security
+- A button click (component interaction) is refused with an ephemeral "not linked" reply unless the Discord user maps to
+  a Lyndrix user — no mapping exists yet, so every click is refused (fail closed). `metadata.raw_interaction` is an
+  allow-list of ids; the interaction token and the member object never reach the bus (DN-03).
+- The public `/interactions` route caps the body at 64 KiB (413) before any key lookup and reads the public key at most
+  once per 60 s. New setting `interactions_public_key`; the Vault secret `discord_public_key` remains the fallback, and
+  a value that is not 64 hex characters counts as not configured (503) (DN-04).
+- Request errors are logged by exception type only (a webhook URL contains its token); a 401/403 from Discord drops the
+  cached config so a rotated token is re-read.
+- `requests >= 2.32.4` (CVE-2024-47081, hardening).
+
+### Documentation
+- Interactive buttons are documented as a planned feature with their prerequisites (account linking, permission
+  check per action, audit trail): `docs/planned-features.md`.
+
+### Fixed
+- One notification can no longer become several Discord messages: a failed edit never reposts (only "message gone"
+  does), a 429 wait is bounded by the send deadline so exactly one party retries, and the first send claims the
+  `discord_messages` row before posting, so two instances cannot both post (DN-01, DN-02, DN-07).
+- `health()` and `send()` read the config through the 120 s Vault cache instead of two to four Vault reads per call
+  (DN-05).
+- Retention of `discord_messages` runs hourly under the lease `discord:prune` on exactly one instance; it no longer
+  depends on the core leader sending a message itself (DN-06).
+
+The following notes were kept under "Unreleased" in earlier trees although the code was already part of the
+1.2.0 tag (canonical layout, fail-closed interactions); they are listed here so they are not lost.
+
+### Security (earlier)
 - Interaction endpoint now fails closed (HTTP 503) when `discord_public_key` is
   not configured, instead of processing unsigned requests.
 - Added replay protection: interactions with a stale signed timestamp are rejected.
 
-### Changed
+### Changed (earlier)
 - Moved to the canonical plugin layout: `app/controller/` → `app/logic/`, router
   into `app/api/`, NiceGUI page into `app/ui/nicegui/`.
 - Imports now go through the stable `core.api` surface (no `core.components.*` /
@@ -23,10 +53,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NiceGUI settings page persists through `DiscordGatewayAdapter.save_config()`
   (webhook URLs are validated) instead of writing Vault directly.
 
-### Fixed
+### Fixed (earlier)
 - Settings page no longer exposes a non-functional "enabled" switch; bot name is
   now persisted and its default matches the adapter (`Lyndrix`).
 - Rewrote the broken test suite against the current adapter/service API.
+
+## [1.2.0] - 2026-10-15
+### Changed
+- Cluster readiness: the notification → Discord message id map moved from process
+  memory into the shared DB table `discord_messages` (PK `notification_id` +
+  `provider_id`, with `channel_id`, `discord_message_id`, `created_at`,
+  `updated_at`). An update handled by another core instance — or after a restart —
+  now edits the original message instead of posting a new one. A 60 s per-process
+  cache sits in front; without a DB the plugin falls back to the old in-memory map.
+- Table creation is idempotent and serialized by the core's `lyndrix_bootstrap`
+  advisory lock; it runs at setup when the DB is already connected and again on
+  every `db:connected`. Writes use READ COMMITTED sessions and retry MariaDB
+  1020/1205/1213; a concurrent insert of the same key is tolerated.
+- `get_config_fields()` (called synchronously by the core) serves Vault values
+  cached by the off-thread `health()`/`send()` reads instead of hitting Vault on
+  the event loop every time.
+
+### Added
+- Setting `message_retention_days` (default 30): mappings not updated for that long
+  are pruned by the leader instance (at most hourly, piggy-backed on writes).
+- `health()` reports `tracked_messages` (row count of `discord_messages`).
+
+### Removed
+- The per-process `notifications_sent` counter (never incremented); `health()` no
+  longer reports it.
+
+### Notes
+- Every instance needs identical `LYNDRIX_GATEWAY_*` env vars; 429 back-off is
+  per instance (not coordinated across the cluster).
 
 ## [0.1.0] - 2026-05-26
 ### Changed

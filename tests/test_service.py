@@ -1,6 +1,5 @@
+import asyncio
 import logging
-
-import pytest
 
 from app.logic.adapter import DiscordGatewayAdapter, _truncate
 from app.logic.service import DiscordNotifierService
@@ -30,10 +29,9 @@ class StubCtx:
         return coro
 
 
-def test_service_starts_with_zero_sent():
+def test_service_without_db_reports_no_tracked_messages():
     service = DiscordNotifierService(StubCtx())
-    assert service.state["notifications_sent"] == 0
-    assert service.notifications_sent == 0
+    assert asyncio.run(service.tracked_messages()) is None
 
 
 def test_truncate_appends_ellipsis_when_over_limit():
@@ -67,16 +65,17 @@ def test_save_config_rejects_invalid_webhook_url():
     )
 
 
-@pytest.mark.asyncio
-async def test_handle_incoming_routes_component_with_correlation():
+def test_handle_incoming_routes_component_with_correlation(monkeypatch):
     adapter = DiscordGatewayAdapter(StubCtx(), instance_id="ops")
+    # A linked account (no such mapping ships yet — see test_interactions.py).
+    monkeypatch.setattr(adapter, "lyndrix_user_for", lambda uid: "alice" if uid == "42" else None)
     corr = "123e4567-e89b-12d3-a456-426614174000"
     raw = {
         "type": 3,
         "data": {"custom_id": f"approve:{corr}"},
         "member": {"user": {"id": "42"}},
     }
-    inbound = await adapter.handle_incoming(raw)
+    inbound = asyncio.run(adapter.handle_incoming(raw))
     assert inbound is not None
     assert inbound.provider_id == "discord:ops"
     assert inbound.action_id == "approve"
@@ -84,7 +83,16 @@ async def test_handle_incoming_routes_component_with_correlation():
     assert inbound.user_id == "42"
 
 
-@pytest.mark.asyncio
-async def test_handle_incoming_ignores_ping():
+def test_handle_incoming_ignores_ping():
     adapter = DiscordGatewayAdapter(StubCtx())
-    assert await adapter.handle_incoming({"type": 1}) is None
+    assert asyncio.run(adapter.handle_incoming({"type": 1})) is None
+
+
+def test_requests_floor_excludes_the_netrc_leak():
+    """DN-04..07 dependency note: requests < 2.32.4 has CVE-2024-47081."""
+    from pathlib import Path
+
+    lines = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text().splitlines()
+    spec = next(line for line in lines if line.lower().startswith("requests"))
+    floor = tuple(int(part) for part in spec.split(">=")[1].split("."))
+    assert floor >= (2, 32, 4)
