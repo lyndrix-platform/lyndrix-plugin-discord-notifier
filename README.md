@@ -46,9 +46,11 @@ https://github.com/lyndrix-platform/lyndrix-plugin-discord-notifier
 
 ```
 entrypoint.py          # manifest + lifecycle wiring only
-app/controller/        # DiscordGatewayAdapter, webhook sender, DiscordNotifierService
-app/ui/settings.py     # NiceGUI settings UI
-tests/                 # service smoke tests
+app/model/             # SQLAlchemy models (discord_messages), DB helpers
+app/logic/             # DiscordGatewayAdapter, message store, DiscordNotifierService
+app/api/               # public /interactions router
+app/ui/nicegui/        # NiceGUI settings UI
+tests/                 # service, delivery, interaction and message-store tests
 ```
 
 ## Documentation
